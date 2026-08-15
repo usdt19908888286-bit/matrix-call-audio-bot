@@ -34,6 +34,7 @@ let matrixRtcModulePromise = null;
 let matrixRtcClientPromise = null;
 const matrixRtcContexts = new Map();
 const matrixRtcMemberIds = new Map();
+const simpleOneToOneCalls = new Map();
 
 function sendJson(res, status, body) {
   const data = JSON.stringify(body);
@@ -961,6 +962,94 @@ async function waitForLiveKitRemoteParticipant(roomId, timeoutMs = 45000) {
   }
 }
 
+async function stopSimpleOneToOneCall(session, roomId) {
+  const active = simpleOneToOneCalls.get(roomId);
+  let left = false;
+  if (active?.rtcSession?.isJoined?.()) {
+    try {
+      left = Boolean(await active.rtcSession.leaveRoomSession(10000));
+    } catch (error) {
+      console.warn(`[1:1] leave failed room=${roomId}: ${error?.message || error}`);
+    }
+  }
+  if (active?.rtcSession) {
+    try { await active.rtcSession.stop?.(); } catch {}
+  }
+  simpleOneToOneCalls.delete(roomId);
+  const cleared = await clearStaleOwnRtcMemberships(session, roomId, '');
+  return { left, cleared };
+}
+
+async function startSimpleOneToOneCall(session, roomId) {
+  // Mirror the already-working local caller exactly at the signaling layer:
+  // getRoomSession() -> joinRoomSession() -> SDK-generated ring.
+  // No LiveKit media connection and no sticky-membership mode are used here.
+  if (simpleOneToOneCalls.has(roomId)) {
+    await stopSimpleOneToOneCall(session, roomId);
+  }
+  if (matrixRtcContexts.has(roomId) || liveKitConnections.has(roomId)) {
+    await disconnectLiveKitRoom(roomId);
+  }
+
+  const cleared = await clearStaleOwnRtcMemberships(session, roomId, '');
+  if (cleared.length) await new Promise((resolve) => setTimeout(resolve, 1200));
+
+  const client = await ensureMatrixRtcClient(session);
+  let room = client.getRoom(roomId);
+  if (!room) {
+    await client.joinRoom(roomId);
+    room = client.getRoom(roomId);
+  }
+  if (!room) throw new Error(`Matrix room is not available in matrix-js-sdk: ${roomId}`);
+
+  const joined = room.getJoinedMembers?.() || [];
+  const opponents = joined.filter((member) => member.userId !== session.userId);
+  if (opponents.length !== 1) {
+    const error = new Error(`1:1 call requires exactly one remote joined member; found ${opponents.length}`);
+    error.status = 409;
+    throw error;
+  }
+
+  const rtc = await discoverMatrixRtcTransport(session);
+  const focus = { ...rtc.transport, livekit_alias: roomId };
+  const rtcSession = client.matrixRTC.getRoomSession(room);
+  await rtcSession.initialMembershipCalculated;
+
+  const notificationPromise = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('MatrixRTC ring notification was not sent within 20000ms')), 20000);
+    rtcSession.once('did_send_call_notification', (notification) => {
+      clearTimeout(timer);
+      resolve(notification);
+    });
+    rtcSession.once('membership_manager_error', (error) => {
+      clearTimeout(timer);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    });
+  });
+
+  rtcSession.joinRoomSession([], focus, {
+    notificationType: 'ring',
+    callIntent: 'audio',
+    manageMediaKeys: true,
+  });
+  simpleOneToOneCalls.set(roomId, { rtcSession, roomId, startedAt: Date.now() });
+
+  try {
+    const notification = await notificationPromise;
+    return {
+      roomId,
+      opponentUserId: opponents[0].userId,
+      notificationEventId: notification?.event_id || null,
+      notificationType: notification?.notification_type || 'ring',
+      state: 'ringing',
+      focus,
+    };
+  } catch (error) {
+    await stopSimpleOneToOneCall(session, roomId).catch(() => {});
+    throw error;
+  }
+}
+
 function summarizeMatrixRtcContext(roomId, context) {
   return {
     roomId,
@@ -1318,6 +1407,8 @@ const server = http.createServer(async (req, res) => {
         matrixPrepare: 'POST /matrix/prepare',
         matrixToken: 'POST /matrix/token',
         matrixConnect: 'POST /matrix/connect',
+        matrixCall: 'POST /matrix/call',
+        matrixHangup: 'POST /matrix/hangup',
         matrixCallAudio: 'POST /matrix/call-audio',
         matrixPlayAudio: 'POST /matrix/play-audio',
         matrixLiveKitStatus: 'GET /matrix/livekit-status',
@@ -1727,6 +1818,52 @@ const server = http.createServer(async (req, res) => {
         capabilities: e.capabilities || undefined,
         details: e.body || undefined,
       });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/matrix/call') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    try {
+      const body = await readJson(req);
+      const session = await ensureMatrixSession();
+      const autoJoin = await matrixAutoJoinInvites(session);
+      const selected = await discoverJoinedRoom(session, {
+        roomId: body.roomId,
+        targetUserId: body.targetUserId,
+      });
+      const call = await startSimpleOneToOneCall(session, selected.roomId);
+      return sendJson(res, 202, {
+        ok: true,
+        status: 'ringing',
+        selectedBy: selected.selectedBy,
+        autoJoin,
+        matrix: { userId: session.userId, deviceId: session.deviceId },
+        call,
+        note: 'Simple 1:1 signaling path; no bot audio yet.',
+      });
+    } catch (e) {
+      return sendJson(res, e.status || 502, {
+        ok: false,
+        error: String(e.message || e),
+        candidates: e.candidates || undefined,
+        details: e.body || undefined,
+      });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/matrix/hangup') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    try {
+      const body = await readJson(req);
+      const session = await ensureMatrixSession();
+      const selected = await discoverJoinedRoom(session, {
+        roomId: body.roomId,
+        targetUserId: body.targetUserId,
+      });
+      const result = await stopSimpleOneToOneCall(session, selected.roomId);
+      return sendJson(res, 200, { ok: true, status: 'ended', roomId: selected.roomId, ...result });
+    } catch (e) {
+      return sendJson(res, e.status || 502, { ok: false, error: String(e.message || e) });
     }
   }
 
