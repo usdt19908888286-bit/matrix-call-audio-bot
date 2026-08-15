@@ -399,6 +399,34 @@ async function matrixRtcJwtHealth(focus) {
   }
 }
 
+async function requestLegacyLiveKitToken(focus, session, roomId, openId) {
+  const base = String(focus.livekit_service_url || '').replace(/\/$/, '');
+  if (!base) throw new Error('missing livekit_service_url');
+
+  const response = await fetchJson(`${base}/sfu/get`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      room: roomId,
+      openid_token: openId,
+      device_id: session.deviceId,
+    }),
+  });
+
+  if (!response?.url || !response?.jwt) {
+    throw new Error('MatrixRTC authorization service returned no LiveKit url/jwt');
+  }
+
+  return {
+    url: response.url,
+    jwt: response.jwt,
+    mode: 'legacy_sfu_get',
+  };
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
@@ -416,6 +444,7 @@ const server = http.createServer(async (req, res) => {
         matrixStatus: 'GET /matrix/status',
         matrixRooms: 'GET /matrix/rooms',
         matrixPrepare: 'POST /matrix/prepare',
+        matrixToken: 'POST /matrix/token',
       },
     });
   }
@@ -535,6 +564,51 @@ const server = http.createServer(async (req, res) => {
         ok: false,
         error: String(e.message || e),
         candidates: e.candidates || undefined,
+      });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/matrix/token') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    try {
+      const body = await readJson(req);
+      const session = await ensureMatrixSession();
+      const autoJoin = await matrixAutoJoinInvites(session);
+      const selected = await discoverJoinedRoom(session, {
+        roomId: body.roomId,
+        targetUserId: body.targetUserId,
+      });
+      const membership = await matrixRoomMembership(session, selected.roomId);
+      const rtc = await discoverMatrixRtcFocus(session.userId);
+      const openId = await requestMatrixOpenId(session);
+      const livekit = await requestLegacyLiveKitToken(rtc.focus, session, selected.roomId, openId);
+
+      return sendJson(res, 200, {
+        ok: true,
+        status: 'livekit_token_ready',
+        roomId: selected.roomId,
+        selectedBy: selected.selectedBy,
+        autoJoin,
+        matrix: {
+          userId: session.userId,
+          deviceId: session.deviceId,
+          membership: membership.membership || null,
+        },
+        rtc: {
+          authorizationService: rtc.focus.livekit_service_url,
+          mode: livekit.mode,
+          livekitUrl: livekit.url,
+          jwtReady: true,
+          jwtLength: livekit.jwt.length,
+        },
+        note: 'LiveKit URL and JWT were issued successfully. The next stage is connecting the Node client to LiveKit.',
+      });
+    } catch (e) {
+      return sendJson(res, e.status || 502, {
+        ok: false,
+        error: String(e.message || e),
+        candidates: e.candidates || undefined,
+        details: e.body || undefined,
       });
     }
   }
