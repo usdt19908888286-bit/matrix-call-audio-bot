@@ -803,8 +803,9 @@ async function connectLiveKitRoom(roomId, livekit, e2eeContext) {
         encryptionType: EncryptionType.GCM,
         keyProviderOptions: {
           sharedKey: initialKey,
-          ratchetWindowSize: 10,
-          failureTolerance: 10,
+          ratchetSalt: new TextEncoder().encode('LKFrameEncryptionKey'),
+          ratchetWindowSize: 16,
+          failureTolerance: -1,
         },
       },
     });
