@@ -356,17 +356,115 @@ async function activeRtcEvents(session, roomId) {
   });
 }
 
+async function clearStaleOwnRtcMemberships(session, roomId, keepMemberId = '') {
+  const client = await ensureMatrixRtcClient(session);
+  const cleared = [];
+
+  // Clear stale MSC4143/MSC4354 sticky memberships left by older audio-bot processes.
+  const stickyEvents = await activeRtcEvents(session, roomId);
+  for (const event of stickyEvents) {
+    const content = event?.getContent?.() || {};
+    const member = content?.member || {};
+    const memberId = String(member.id || '');
+    if (member.user_id !== session.userId || !memberId || memberId === keepMemberId) continue;
+    try {
+      await client._unstable_sendStickyEvent(
+        roomId,
+        60 * 60 * 1000,
+        null,
+        'org.matrix.msc4143.rtc.member',
+        { msc4354_sticky_key: memberId },
+      );
+      cleared.push({ type: 'sticky', memberId, deviceId: member.device_id || '' });
+      console.log(`[MatrixRTC] cleared stale sticky membership room=${roomId} member=${memberId}`);
+    } catch (error) {
+      console.warn(`[MatrixRTC] failed clearing stale sticky membership room=${roomId} member=${memberId}: ${error?.message || error}`);
+    }
+  }
+
+  // Clear legacy m.call.member state left by an older implementation too.
+  // These are the classic long-lived memberships that can make a fresh ring
+  // look like it has already been running for several hours.
+  const state = await matrixRoomState(session, roomId);
+  for (const event of state) {
+    if (event?.type !== 'org.matrix.msc3401.call.member') continue;
+    if (event?.sender !== session.userId) continue;
+    const content = event?.content || {};
+    if (!Object.keys(content).length || content.application !== 'm.call') continue;
+    const stateKey = String(event.state_key || '');
+    if (!stateKey) continue;
+    try {
+      await matrixRequest(
+        'PUT',
+        `/_matrix/client/v3/rooms/${encodeURIComponent(roomId)}/state/org.matrix.msc3401.call.member/${encodeURIComponent(stateKey)}`,
+        {},
+        session.accessToken,
+      );
+      cleared.push({
+        type: 'legacy',
+        stateKey,
+        memberId: content.membershipID || '',
+        deviceId: content.device_id || '',
+      });
+      console.log(`[MatrixRTC] cleared stale legacy membership room=${roomId} stateKey=${stateKey}`);
+    } catch (error) {
+      console.warn(`[MatrixRTC] failed clearing stale legacy membership room=${roomId} stateKey=${stateKey}: ${error?.message || error}`);
+    }
+  }
+
+  return cleared;
+}
+
 async function matrixRoomSummary(session, roomId, includeMembers = false) {
   const state = await matrixRoomState(session, roomId);
   const nameEvent = state.find((e) => e?.type === 'm.room.name' && e?.content?.name);
   const aliasEvent = state.find((e) => e?.type === 'm.room.canonical_alias' && e?.content?.alias);
   const rtcEvents = await activeRtcEvents(session, roomId);
+  const stickyRtcMembers = rtcEvents.map((event) => {
+    const content = event?.getContent?.() || {};
+    return {
+      type: 'org.matrix.msc4143.rtc.member',
+      userId: content?.member?.user_id || event?.getSender?.() || '',
+      deviceId: content?.member?.device_id || '',
+      memberId: content?.member?.id || '',
+      slotId: content?.slot_id || '',
+      intent: content?.application?.['m.call.intent'] || '',
+      eventId: event?.getId?.() || '',
+      timestamp: event?.getTs?.() || null,
+    };
+  });
+  const now = Date.now();
+  const legacyRtcMembers = state
+    .filter((event) => event?.type === 'org.matrix.msc3401.call.member' && event?.content && Object.keys(event.content).length > 0)
+    .map((event) => {
+      const content = event.content || {};
+      const createdTs = Number(content.created_ts || event.origin_server_ts || 0) || 0;
+      const expires = Number(content.expires || 0) || 0;
+      const expiresAt = createdTs && expires ? createdTs + expires : 0;
+      return {
+        type: 'org.matrix.msc3401.call.member',
+        userId: event.sender || '',
+        deviceId: content.device_id || '',
+        memberId: content.membershipID || '',
+        callId: content.call_id ?? null,
+        intent: content['m.call.intent'] || '',
+        stateKey: event.state_key || '',
+        eventId: event.event_id || '',
+        createdTs: createdTs || null,
+        ageMs: createdTs ? Math.max(0, now - createdTs) : null,
+        expires,
+        expiresAt: expiresAt || null,
+        expired: expiresAt ? expiresAt <= now : null,
+      };
+    });
   const summary = {
     roomId,
     name: nameEvent?.content?.name || '',
     alias: aliasEvent?.content?.alias || '',
-    rtcActive: rtcEvents.length > 0,
-    rtcMemberCount: rtcEvents.length,
+    rtcActive: stickyRtcMembers.length > 0 || legacyRtcMembers.some((member) => member.expired !== true),
+    rtcMemberCount: stickyRtcMembers.length,
+    stickyRtcMembers,
+    legacyRtcMembers,
   };
 
   if (includeMembers) {
@@ -666,6 +764,11 @@ async function ensureMatrixRtcE2ee(session, roomId, transport) {
   }
   if (!room) throw new Error(`MatrixRTC room is not available in matrix-js-sdk: ${roomId}`);
   const ownMemberId = matrixRtcMemberId(session);
+
+  const staleCleared = await clearStaleOwnRtcMemberships(session, roomId, ownMemberId);
+  if (staleCleared.length) {
+    console.log(`[MatrixRTC] stale memberships cleared before join room=${roomId} count=${staleCleared.length}`);
+  }
 
   let rtcSession = context?.rtcSession;
   if (!rtcSession || context?.client !== client) {
@@ -1130,6 +1233,7 @@ const server = http.createServer(async (req, res) => {
         matrixPlayAudio: 'POST /matrix/play-audio',
         matrixLiveKitStatus: 'GET /matrix/livekit-status',
         matrixDisconnect: 'POST /matrix/disconnect',
+        matrixCleanupStale: 'POST /matrix/cleanup-stale',
       },
     });
   }
@@ -1226,6 +1330,44 @@ const server = http.createServer(async (req, res) => {
       });
     } catch (e) {
       return sendJson(res, 502, { ok: false, error: String(e.message || e) });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/matrix/cleanup-stale') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    try {
+      const session = await ensureMatrixSession();
+      const disconnected = await disconnectAllRtcRooms();
+      const autoJoin = await matrixAutoJoinInvites(session);
+      const joinedRooms = await matrixJoinedRooms(session);
+      const cleared = [];
+      const rooms = [];
+
+      for (const roomId of joinedRooms) {
+        try {
+          const roomCleared = await clearStaleOwnRtcMemberships(session, roomId, '');
+          if (roomCleared.length) cleared.push({ roomId, memberships: roomCleared });
+          rooms.push(await matrixRoomSummary(session, roomId, true));
+        } catch (error) {
+          rooms.push({ roomId, error: String(error?.message || error) });
+        }
+      }
+
+      return sendJson(res, 200, {
+        ok: true,
+        status: 'stale_audio_bot_memberships_cleared',
+        disconnected,
+        autoJoin,
+        clearedCount: cleared.reduce((sum, item) => sum + item.memberships.length, 0),
+        cleared,
+        rooms,
+      });
+    } catch (e) {
+      return sendJson(res, e.status || 502, {
+        ok: false,
+        error: String(e.message || e),
+        details: e.body || undefined,
+      });
     }
   }
 
