@@ -9,10 +9,10 @@ const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const MATRIX_HOMESERVER = String(process.env.MATRIX_HOMESERVER || '').replace(/\/$/, '');
 const MATRIX_USER_ID = String(process.env.MATRIX_USER_ID || '').trim();
 const MATRIX_PASSWORD = String(process.env.MATRIX_PASSWORD || '');
-const MATRIX_DEVICE_ID_PREFIX = String(process.env.MATRIX_DEVICE_ID || 'AUDIOBOT01').trim() || 'AUDIOBOT01';
-const MATRIX_LOGIN_DEVICE_ID = `${MATRIX_DEVICE_ID_PREFIX}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+const MATRIX_ACCESS_TOKEN = String(process.env.MATRIX_ACCESS_TOKEN || '').trim();
+const MATRIX_DEVICE_ID = String(process.env.MATRIX_DEVICE_ID || 'AUDIOBOT01').trim() || 'AUDIOBOT01';
 const MATRIX_RTC_SLOT_ID = String(process.env.MATRIX_RTC_SLOT_ID || 'm.call#ROOM').trim() || 'm.call#ROOM';
-const MATRIX_RTC_MEMBER_ID_OVERRIDE = String(process.env.MATRIX_RTC_MEMBER_ID || '').trim();
+const MATRIX_RTC_MEMBER_ID = String(process.env.MATRIX_RTC_MEMBER_ID || '').trim() || `${MATRIX_DEVICE_ID}-${crypto.randomUUID()}`;
 
 const jobs = new Map();
 let matrixSession = null;
@@ -22,7 +22,6 @@ let matrixJsSdkPromise = null;
 let matrixRtcModulePromise = null;
 let matrixRtcClientPromise = null;
 const matrixRtcContexts = new Map();
-const matrixRtcMemberIds = new Map();
 
 function sendJson(res, status, body) {
   const data = JSON.stringify(body);
@@ -123,7 +122,7 @@ function serveWavFile(res, name) {
 }
 
 function matrixConfigured() {
-  return Boolean(MATRIX_HOMESERVER && MATRIX_USER_ID && MATRIX_PASSWORD);
+  return Boolean(MATRIX_HOMESERVER && MATRIX_USER_ID && (MATRIX_ACCESS_TOKEN || MATRIX_PASSWORD));
 }
 
 async function fetchJson(url, options = {}) {
@@ -158,7 +157,7 @@ async function matrixRequest(method, pathname, body, accessToken) {
 
 async function ensureMatrixSession() {
   if (!matrixConfigured()) {
-    throw new Error('Matrix is not configured. Set MATRIX_HOMESERVER, MATRIX_USER_ID and MATRIX_PASSWORD.');
+    throw new Error('Matrix is not configured. Set MATRIX_HOMESERVER, MATRIX_USER_ID and MATRIX_PASSWORD or MATRIX_ACCESS_TOKEN.');
   }
 
   if (matrixSession?.accessToken) {
@@ -166,7 +165,7 @@ async function ensureMatrixSession() {
       const who = await matrixRequest('GET', '/_matrix/client/v3/account/whoami', undefined, matrixSession.accessToken);
       if (who.user_id) {
         matrixSession.userId = who.user_id;
-        matrixSession.deviceId = who.device_id || matrixSession.deviceId || MATRIX_LOGIN_DEVICE_ID;
+        matrixSession.deviceId = who.device_id || matrixSession.deviceId || MATRIX_DEVICE_ID;
         return matrixSession;
       }
     } catch {
@@ -174,11 +173,23 @@ async function ensureMatrixSession() {
     }
   }
 
+  if (MATRIX_ACCESS_TOKEN) {
+    const who = await matrixRequest('GET', '/_matrix/client/v3/account/whoami', undefined, MATRIX_ACCESS_TOKEN);
+    matrixSession = {
+      accessToken: MATRIX_ACCESS_TOKEN,
+      userId: who.user_id || MATRIX_USER_ID,
+      deviceId: who.device_id || MATRIX_DEVICE_ID,
+      source: 'access_token',
+      loggedInAt: Date.now(),
+    };
+    return matrixSession;
+  }
+
   const login = await matrixRequest('POST', '/_matrix/client/v3/login', {
     type: 'm.login.password',
     identifier: { type: 'm.id.user', user: MATRIX_USER_ID },
     password: MATRIX_PASSWORD,
-    device_id: MATRIX_LOGIN_DEVICE_ID,
+    device_id: MATRIX_DEVICE_ID,
     initial_device_display_name: 'Matrix Audio Bot',
   });
 
@@ -187,7 +198,7 @@ async function ensureMatrixSession() {
   matrixSession = {
     accessToken: login.access_token,
     userId: login.user_id || MATRIX_USER_ID,
-    deviceId: login.device_id || MATRIX_LOGIN_DEVICE_ID,
+    deviceId: login.device_id || MATRIX_DEVICE_ID,
     source: 'password_login',
     loggedInAt: Date.now(),
   };
@@ -201,55 +212,20 @@ function matrixServerName(userId) {
   return MATRIX_HOMESERVER.replace(/^https?:\/\//, '').split('/')[0];
 }
 
-function matrixRtcSlotDescription() {
-  const separator = MATRIX_RTC_SLOT_ID.indexOf('#');
-  if (separator <= 0 || separator === MATRIX_RTC_SLOT_ID.length - 1) {
-    throw new Error(`invalid MATRIX_RTC_SLOT_ID: ${MATRIX_RTC_SLOT_ID}`);
-  }
-  return {
-    application: MATRIX_RTC_SLOT_ID.slice(0, separator),
-    id: MATRIX_RTC_SLOT_ID.slice(separator + 1),
-  };
-}
+async function discoverMatrixRtcFocus(userId) {
+  const serverName = matrixServerName(userId);
+  const wellKnown = await fetchJson(`https://${serverName}/.well-known/matrix/client`, {
+    headers: { accept: 'application/json' },
+  });
 
-function matrixRtcMemberId(session) {
-  if (MATRIX_RTC_MEMBER_ID_OVERRIDE) return MATRIX_RTC_MEMBER_ID_OVERRIDE;
-  const key = `${session.userId}|${session.deviceId}`;
-  let memberId = matrixRtcMemberIds.get(key);
-  if (!memberId) {
-    memberId = `${session.deviceId}-${crypto.randomUUID()}`;
-    matrixRtcMemberIds.set(key, memberId);
-  }
-  return memberId;
-}
-
-async function discoverMatrixRtcTransport(session) {
-  const data = await matrixRequest(
-    'GET',
-    '/_matrix/client/unstable/org.matrix.msc4143/rtc/transports',
-    undefined,
-    session.accessToken,
-  );
-  const transports = Array.isArray(data?.rtc_transports) ? data.rtc_transports : [];
-  if (!transports.length) {
-    const error = new Error('No MatrixRTC transports returned by MSC4143 /rtc/transports');
-    error.status = 409;
-    throw error;
+  const foci = wellKnown['m.rtc_foci'] || wellKnown['org.matrix.msc4143.rtc_foci'] || [];
+  if (!Array.isArray(foci) || !foci.length) {
+    throw new Error('No MatrixRTC focus found in .well-known/matrix/client');
   }
 
-  const transport = transports.find((item) => item?.type === 'livekit');
-  if (!transport?.livekit_service_url) {
-    const error = new Error('Latest MatrixRTC transport discovery returned no LiveKit transport');
-    error.status = 409;
-    throw error;
-  }
-
-  return {
-    serverName: matrixServerName(session.userId),
-    transport,
-    transports,
-    discovery: 'msc4143_rtc_transports',
-  };
+  const focus = foci.find((item) => item?.type === 'livekit') || foci[0];
+  if (!focus?.livekit_service_url) throw new Error('MatrixRTC focus has no livekit_service_url');
+  return { serverName, focus, foci };
 }
 
 async function matrixRoomMembership(session, roomId) {
@@ -312,18 +288,17 @@ async function matrixJoinedMembers(session, roomId) {
   return data && typeof data.joined === 'object' && data.joined ? data.joined : {};
 }
 
-async function activeRtcEvents(session, roomId) {
-  const client = await ensureMatrixRtcClient(session);
-  const room = client.getRoom(roomId);
-  if (!room || typeof room._unstable_getStickyEvents !== 'function') return [];
-
-  return Array.from(room._unstable_getStickyEvents()).filter((event) => {
-    if (event?.getType?.() !== 'org.matrix.msc4143.rtc.member') return false;
-    const content = event.getContent?.() || {};
-    if (content.slot_id !== MATRIX_RTC_SLOT_ID) return false;
-    if (content?.application?.type !== 'm.call') return false;
-    if (!content?.member?.user_id || !content?.member?.device_id || !content?.member?.id) return false;
-    return true;
+function activeRtcEvents(state) {
+  const now = Date.now();
+  return state.filter((event) => {
+    if (!event || !['org.matrix.msc3401.call.member', 'm.call.member'].includes(event.type)) return false;
+    const content = event.content;
+    if (!content || typeof content !== 'object' || !Object.keys(content).length) return false;
+    if (content.application && content.application !== 'm.call') return false;
+    const expires = Number(content.expires || 0);
+    const origin = Number(event.origin_server_ts || 0);
+    if (expires > 0 && origin > 0 && origin + expires < now) return false;
+    return Boolean(content.focus_active || content.foci_preferred || content.membershipID || content.device_id);
   });
 }
 
@@ -331,7 +306,7 @@ async function matrixRoomSummary(session, roomId, includeMembers = false) {
   const state = await matrixRoomState(session, roomId);
   const nameEvent = state.find((e) => e?.type === 'm.room.name' && e?.content?.name);
   const aliasEvent = state.find((e) => e?.type === 'm.room.canonical_alias' && e?.content?.alias);
-  const rtcEvents = await activeRtcEvents(session, roomId);
+  const rtcEvents = activeRtcEvents(state);
   const summary = {
     roomId,
     name: nameEvent?.content?.name || '',
@@ -417,31 +392,8 @@ async function requestMatrixOpenId(session) {
   );
 }
 
-async function requireLatestMatrixRtcServerFeatures(session) {
-  const versions = await matrixRequest('GET', '/_matrix/client/versions', undefined, session.accessToken);
-  const unstable = versions?.unstable_features && typeof versions.unstable_features === 'object'
-    ? versions.unstable_features
-    : {};
-  const capabilities = {
-    msc4140DelayedEvents: unstable['org.matrix.msc4140'] === true,
-    msc4143MatrixRtc: unstable['org.matrix.msc4143'] === true,
-    msc4354StickyEvents: unstable['org.matrix.msc4354'] === true,
-  };
-  const missing = [];
-  if (!capabilities.msc4140DelayedEvents) missing.push('MSC4140 delayed events');
-  if (!capabilities.msc4143MatrixRtc) missing.push('MSC4143 MatrixRTC transports');
-  if (!capabilities.msc4354StickyEvents) missing.push('MSC4354 sticky events');
-  if (missing.length) {
-    const error = new Error(`Latest MatrixRTC server features are missing: ${missing.join(', ')}`);
-    error.status = 409;
-    error.capabilities = capabilities;
-    throw error;
-  }
-  return capabilities;
-}
-
-async function matrixRtcJwtHealth(transport) {
-  const base = String(transport.livekit_service_url || '').replace(/\/$/, '');
+async function matrixRtcJwtHealth(focus) {
+  const base = String(focus.livekit_service_url || '').replace(/\/$/, '');
   if (!base) return { ok: false, error: 'missing livekit_service_url' };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5000);
@@ -455,13 +407,12 @@ async function matrixRtcJwtHealth(transport) {
   }
 }
 
-async function requestLatestLiveKitToken(transport, session, roomId, openId, options = {}) {
-  const base = String(transport.livekit_service_url || '').replace(/\/$/, '');
+async function requestModernLiveKitToken(focus, session, roomId, openId, options = {}) {
+  const base = String(focus.livekit_service_url || '').replace(/\/$/, '');
   if (!base) throw new Error('missing livekit_service_url');
 
   const slotId = String(options.slotId || MATRIX_RTC_SLOT_ID).trim() || MATRIX_RTC_SLOT_ID;
-  const defaultMemberId = matrixRtcMemberId(session);
-  const memberId = String(options.memberId || defaultMemberId).trim() || defaultMemberId;
+  const memberId = String(options.memberId || MATRIX_RTC_MEMBER_ID).trim() || MATRIX_RTC_MEMBER_ID;
 
   const response = await fetchJson(`${base}/get_token`, {
     method: 'POST',
@@ -549,11 +500,6 @@ async function waitForMatrixPrepared(client, sdk, timeoutMs = 20000) {
 }
 
 async function ensureMatrixRtcClient(session) {
-  if (session.source !== 'password_login') {
-    const error = new Error('Latest MatrixRTC E2EE mode requires password login so this process can own a fresh Matrix device for the in-memory Rust crypto store');
-    error.status = 409;
-    throw error;
-  }
   if (!matrixRtcClientPromise) {
     matrixRtcClientPromise = (async () => {
       const { sdk } = await loadMatrixRtcSdk();
@@ -623,11 +569,10 @@ async function waitForOwnMatrixRtcKey(context, timeoutMs = 15000) {
   });
 }
 
-async function ensureMatrixRtcE2ee(session, roomId, transport) {
+async function ensureMatrixRtcE2ee(session, roomId, focus) {
   let context = matrixRtcContexts.get(roomId);
   if (context?.rtcSession?.isJoined?.() && context.ownKey) return context;
 
-  await requireLatestMatrixRtcServerFeatures(session);
   const client = await ensureMatrixRtcClient(session);
   const { rtc } = await loadMatrixRtcSdk();
   let room = client.getRoom(roomId);
@@ -636,26 +581,16 @@ async function ensureMatrixRtcE2ee(session, roomId, transport) {
     room = client.getRoom(roomId);
   }
   if (!room) throw new Error(`MatrixRTC room is not available in matrix-js-sdk: ${roomId}`);
-  const ownMemberId = matrixRtcMemberId(session);
 
-  let rtcSession = context?.rtcSession;
-  if (!rtcSession || context?.client !== client) {
-    rtcSession = rtc.MatrixRTCSession.sessionForSlot(
-      client,
-      room,
-      matrixRtcSlotDescription(),
-      {
-        listenForStickyEvents: true,
-        listenForMemberStateEvents: false,
-      },
-    );
-    await rtcSession.initialMembershipCalculated;
+  const rtcSession = client.matrixRTC.getRoomSession(room);
+  await rtcSession.initialMembershipCalculated;
 
+  if (!context || context.rtcSession !== rtcSession) {
     context = {
       client,
       rtcSession,
       roomId,
-      memberId: ownMemberId,
+      memberId: MATRIX_RTC_MEMBER_ID,
       ownKey: null,
       ownKeyIndex: null,
       ownRtcBackendIdentity: '',
@@ -682,7 +617,7 @@ async function ensureMatrixRtcE2ee(session, roomId, transport) {
 
     rtcSession.on(rtc.MatrixRTCSessionEvent.MembershipsChanged, (_oldMemberships, memberships) => {
       const ids = (memberships || []).map((m) => `${m.userId || '?'}/${m.deviceId || '?'}/${m.memberId || '?'}`).join(', ');
-      console.log(`[MatrixRTC] sticky memberships=${memberships?.length || 0}${ids ? ` ${ids}` : ''}`);
+      console.log(`[MatrixRTC] memberships=${memberships?.length || 0}${ids ? ` ${ids}` : ''}`);
     });
 
     rtcSession.on(rtc.MatrixRTCSessionEvent.MembershipManagerError, (error) => {
@@ -690,28 +625,27 @@ async function ensureMatrixRtcE2ee(session, roomId, transport) {
       console.error('[MatrixRTC] membership manager error:', wrapped);
       for (const waiter of Array.from(context.keyWaiters)) waiter.reject(wrapped);
     });
-  } else {
-    await rtcSession.initialMembershipCalculated;
   }
 
   if (!rtcSession.isJoined?.()) {
-    const publishedTransport = {
+    const focusObj = {
       type: 'livekit',
-      livekit_service_url: transport.livekit_service_url,
+      livekit_service_url: focus.livekit_service_url,
+      livekit_alias: roomId,
     };
     const identity = {
       userId: session.userId,
       deviceId: session.deviceId,
-      memberId: ownMemberId,
+      memberId: MATRIX_RTC_MEMBER_ID,
     };
 
-    rtcSession.joinRTCSession(identity, [], publishedTransport, {
+    rtcSession.joinRTCSession(identity, [], focusObj, {
       callIntent: 'audio',
       manageMediaKeys: true,
       unstableSendStickyEvents: true,
     });
     context.joinedAt = Date.now();
-    console.log(`[MatrixRTC] joined MSC4143/MSC4354 sticky membership user=${session.userId} device=${session.deviceId} member=${ownMemberId}`);
+    console.log(`[MatrixRTC] joined user=${session.userId} device=${session.deviceId} member=${MATRIX_RTC_MEMBER_ID}`);
   }
 
   try { rtcSession.reemitEncryptionKeys?.(); } catch {}
@@ -764,9 +698,6 @@ async function disconnectLiveKitRoom(roomId) {
   if (context?.rtcSession?.isJoined?.()) {
     try { await context.rtcSession.leaveRoomSession(3000); } catch {}
   }
-  if (context?.rtcSession) {
-    try { await context.rtcSession.stop?.(); } catch {}
-  }
   return Boolean(connection || context);
 }
 
@@ -791,7 +722,7 @@ async function connectLiveKitRoom(roomId, livekit, e2eeContext) {
     await room.connect(livekit.url, livekit.jwt, {
       autoSubscribe: false,
       dynacast: false,
-      encryption: {
+      e2ee: {
         encryptionType: EncryptionType.GCM,
         keyProviderOptions: {
           sharedKey: initialKey,
@@ -961,7 +892,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       service: 'matrix-call-audio-bot-test',
-      mode: 'latest-matrixrtc-msc4143-msc4354-msc4195-e2ee-audio',
+      mode: 'matrix-rtc-e2ee-audio',
       audioDir: AUDIO_DIR,
       endpoints: {
         health: 'GET /health',
@@ -997,9 +928,8 @@ const server = http.createServer(async (req, res) => {
     try {
       const session = await ensureMatrixSession();
       const autoJoin = await matrixAutoJoinInvites(session);
-      const capabilities = await requireLatestMatrixRtcServerFeatures(session);
-      const rtc = await discoverMatrixRtcTransport(session);
-      const jwtServiceHealth = await matrixRtcJwtHealth(rtc.transport);
+      const rtc = await discoverMatrixRtcFocus(session.userId);
+      const jwtServiceHealth = await matrixRtcJwtHealth(rtc.focus);
       const joinedRooms = await matrixJoinedRooms(session);
 
       return sendJson(res, 200, {
@@ -1015,24 +945,16 @@ const server = http.createServer(async (req, res) => {
           autoJoin,
         },
         rtc: {
-          protocol: 'latest_matrixrtc',
-          capabilities,
-          discovery: rtc.discovery,
-          transport: {
-            type: rtc.transport.type,
-            livekit_service_url: rtc.transport.livekit_service_url,
+          focus: {
+            type: rtc.focus.type,
+            livekit_service_url: rtc.focus.livekit_service_url,
           },
-          transportCount: rtc.transports.length,
+          focusCount: rtc.foci.length,
           jwtServiceHealth,
         },
       });
     } catch (e) {
-      return sendJson(res, e.status || 502, {
-        ok: false,
-        error: String(e.message || e),
-        capabilities: e.capabilities || undefined,
-        details: e.body || undefined,
-      });
+      return sendJson(res, 502, { ok: false, error: String(e.message || e) });
     }
   }
 
@@ -1072,8 +994,7 @@ const server = http.createServer(async (req, res) => {
         targetUserId: body.targetUserId,
       });
       const membership = await matrixRoomMembership(session, selected.roomId);
-      const capabilities = await requireLatestMatrixRtcServerFeatures(session);
-      const rtc = await discoverMatrixRtcTransport(session);
+      const rtc = await discoverMatrixRtcFocus(session.userId);
       const openId = await requestMatrixOpenId(session);
 
       return sendJson(res, 200, {
@@ -1087,12 +1008,9 @@ const server = http.createServer(async (req, res) => {
           membership: membership.membership || null,
         },
         rtc: {
-          protocol: 'latest_matrixrtc',
-          capabilities,
-          discovery: rtc.discovery,
-          transport: {
-            type: rtc.transport.type,
-            livekit_service_url: rtc.transport.livekit_service_url,
+          focus: {
+            type: rtc.focus.type,
+            livekit_service_url: rtc.focus.livekit_service_url,
           },
         },
         openId: {
@@ -1101,15 +1019,13 @@ const server = http.createServer(async (req, res) => {
           matrix_server_name: openId.matrix_server_name,
           token_type: openId.token_type,
         },
-        note: 'Latest MatrixRTC path is ready: MSC4143 transport discovery, OpenID and room membership are available. No legacy RTC focus fallback is used.',
+        note: 'Room was discovered automatically. Matrix auth, membership, RTC focus discovery and OpenID are ready. LiveKit join is the next stage.',
       });
     } catch (e) {
       return sendJson(res, e.status || 502, {
         ok: false,
         error: String(e.message || e),
         candidates: e.candidates || undefined,
-        capabilities: e.capabilities || undefined,
-        details: e.body || undefined,
       });
     }
   }
@@ -1125,12 +1041,11 @@ const server = http.createServer(async (req, res) => {
         targetUserId: body.targetUserId,
       });
       const membership = await matrixRoomMembership(session, selected.roomId);
-      const capabilities = await requireLatestMatrixRtcServerFeatures(session);
-      const rtc = await discoverMatrixRtcTransport(session);
+      const rtc = await discoverMatrixRtcFocus(session.userId);
       const openId = await requestMatrixOpenId(session);
-      const livekit = await requestLatestLiveKitToken(rtc.transport, session, selected.roomId, openId, {
-        slotId: MATRIX_RTC_SLOT_ID,
-        memberId: matrixRtcMemberId(session),
+      const livekit = await requestModernLiveKitToken(rtc.focus, session, selected.roomId, openId, {
+        slotId: body.slotId,
+        memberId: body.memberId,
       });
 
       return sendJson(res, 200, {
@@ -1145,12 +1060,7 @@ const server = http.createServer(async (req, res) => {
           membership: membership.membership || null,
         },
         rtc: {
-          protocol: 'latest_matrixrtc',
-          capabilities,
-          discovery: rtc.discovery,
-          membership: 'msc4143_msc4354_sticky',
-          authorization: 'msc4195_get_token',
-          authorizationService: rtc.transport.livekit_service_url,
+          authorizationService: rtc.focus.livekit_service_url,
           mode: livekit.mode,
           livekitUrl: livekit.url,
           jwtReady: true,
@@ -1165,7 +1075,6 @@ const server = http.createServer(async (req, res) => {
         ok: false,
         error: String(e.message || e),
         candidates: e.candidates || undefined,
-        capabilities: e.capabilities || undefined,
         details: e.body || undefined,
       });
     }
@@ -1182,11 +1091,10 @@ const server = http.createServer(async (req, res) => {
         targetUserId: body.targetUserId,
       });
       const membership = await matrixRoomMembership(session, selected.roomId);
-      const capabilities = await requireLatestMatrixRtcServerFeatures(session);
-      const rtc = await discoverMatrixRtcTransport(session);
-      const e2eeContext = await ensureMatrixRtcE2ee(session, selected.roomId, rtc.transport);
+      const rtc = await discoverMatrixRtcFocus(session.userId);
+      const e2eeContext = await ensureMatrixRtcE2ee(session, selected.roomId, rtc.focus);
       const openId = await requestMatrixOpenId(session);
-      const livekit = await requestLatestLiveKitToken(rtc.transport, session, selected.roomId, openId, {
+      const livekit = await requestModernLiveKitToken(rtc.focus, session, selected.roomId, openId, {
         slotId: MATRIX_RTC_SLOT_ID,
         memberId: e2eeContext.memberId,
       });
@@ -1204,12 +1112,7 @@ const server = http.createServer(async (req, res) => {
           membership: membership.membership || null,
         },
         rtc: {
-          protocol: 'latest_matrixrtc',
-          capabilities,
-          discovery: rtc.discovery,
-          membership: 'msc4143_msc4354_sticky',
-          authorization: 'msc4195_get_token',
-          authorizationService: rtc.transport.livekit_service_url,
+          authorizationService: rtc.focus.livekit_service_url,
           mode: livekit.mode,
           livekitUrl: livekit.url,
           slotId: livekit.slotId,
@@ -1223,7 +1126,6 @@ const server = http.createServer(async (req, res) => {
         ok: false,
         error: String(e.message || e),
         candidates: e.candidates || undefined,
-        capabilities: e.capabilities || undefined,
         details: e.body || undefined,
       });
     }
@@ -1255,7 +1157,6 @@ const server = http.createServer(async (req, res) => {
         ok: false,
         error: String(e.message || e),
         candidates: e.candidates || undefined,
-        capabilities: e.capabilities || undefined,
         details: e.body || undefined,
       });
     }

@@ -1,14 +1,14 @@
 {
   "name": "matrix-call-audio-bot",
-  "version": "1.3.0",
-  "description": "Latest-only MatrixRTC MSC4143/MSC4354/MSC4195 E2EE audio bot",
+  "version": "1.2.0",
+  "description": "MatrixRTC E2EE audio bot with LiveKit connectivity",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@livekit/rtc-node": "0.13.33",
+    "@livekit/rtc-node": "^0.13.32",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "matrix-js-sdk": "42.1.0",
