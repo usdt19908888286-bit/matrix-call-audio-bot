@@ -714,6 +714,14 @@ async function ensureMatrixRtcE2ee(session, roomId, transport) {
     console.log(`[MatrixRTC] joined MSC4143/MSC4354 sticky membership user=${session.userId} device=${session.deviceId} member=${ownMemberId}`);
   }
 
+  // MatrixRTC's first outbound media key is created from EncryptionManager.onMembershipsUpdate().
+  // Do one explicit membership refresh after join so a headless Node client does not have to wait
+  // for a later sticky-event update before the initial key rollout starts.
+  if (!context.ownKey && typeof rtcSession._onRTCSessionMemberUpdate === 'function') {
+    console.log('[MatrixRTC] forcing post-join membership refresh for initial E2EE key rollout');
+    await rtcSession._onRTCSessionMemberUpdate();
+  }
+
   try { rtcSession.reemitEncryptionKeys?.(); } catch {}
   await waitForOwnMatrixRtcKey(context);
   return context;
