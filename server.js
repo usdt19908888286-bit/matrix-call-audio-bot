@@ -13,10 +13,20 @@ const MATRIX_DEVICE_ID_PREFIX = String(process.env.MATRIX_DEVICE_ID || 'AUDIOBOT
 const MATRIX_LOGIN_DEVICE_ID = `${MATRIX_DEVICE_ID_PREFIX}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 const MATRIX_RTC_SLOT_ID = String(process.env.MATRIX_RTC_SLOT_ID || 'm.call#ROOM').trim() || 'm.call#ROOM';
 const MATRIX_RTC_MEMBER_ID_OVERRIDE = String(process.env.MATRIX_RTC_MEMBER_ID || '').trim();
+const MATRIXRTC_E2EE_RATCHET_SALT = new TextEncoder().encode('LKFrameEncryptionKey');
+const MATRIXRTC_E2EE_RATCHET_WINDOW_SIZE = 10;
+const MATRIXRTC_E2EE_FAILURE_TOLERANCE = 10;
+const MATRIXRTC_E2EE_KEY_RING_SIZE = 256;
+const MATRIXRTC_E2EE_KDF_HKDF = 1; // livekit.proto.KeyDerivationFunction.HKDF
+const MATRIX_RTC_SAFETY_TIMEOUT_RAW = Number(process.env.MATRIX_RTC_SAFETY_TIMEOUT_MS || 120000);
+const MATRIX_RTC_SAFETY_TIMEOUT_MS = Number.isFinite(MATRIX_RTC_SAFETY_TIMEOUT_RAW)
+  ? Math.max(0, Math.round(MATRIX_RTC_SAFETY_TIMEOUT_RAW))
+  : 120000;
 
 const jobs = new Map();
 let matrixSession = null;
 const liveKitConnections = new Map();
+const liveKitDisconnectTimers = new Map();
 let liveKitModulePromise = null;
 let matrixJsSdkPromise = null;
 let matrixRtcModulePromise = null;
@@ -124,6 +134,25 @@ function serveWavFile(res, name) {
 
 function matrixConfigured() {
   return Boolean(MATRIX_HOMESERVER && MATRIX_USER_ID && MATRIX_PASSWORD);
+}
+
+function clearLiveKitSafetyDisconnect(roomId) {
+  const timer = liveKitDisconnectTimers.get(roomId);
+  if (timer) clearTimeout(timer);
+  liveKitDisconnectTimers.delete(roomId);
+}
+
+function scheduleLiveKitSafetyDisconnect(roomId) {
+  clearLiveKitSafetyDisconnect(roomId);
+  if (!MATRIX_RTC_SAFETY_TIMEOUT_MS) return;
+  const timer = setTimeout(() => {
+    console.warn(`[MatrixRTC] safety timeout reached; disconnecting room=${roomId}`);
+    disconnectLiveKitRoom(roomId).catch((error) => {
+      console.warn(`[MatrixRTC] safety disconnect failed room=${roomId}: ${error?.message || error}`);
+    });
+  }, MATRIX_RTC_SAFETY_TIMEOUT_MS);
+  timer.unref?.();
+  liveKitDisconnectTimers.set(roomId, timer);
 }
 
 async function fetchJson(url, options = {}) {
@@ -761,26 +790,91 @@ function summarizeLiveKitRoom(roomId, connection) {
   };
 }
 
+function summarizeMatrixRtcContext(roomId, context) {
+  return {
+    roomId,
+    joined: Boolean(context?.rtcSession?.isJoined?.()),
+    memberId: context?.memberId || null,
+    joinedAt: context?.joinedAt || null,
+    keysSeen: Number(context?.keysSeen || 0),
+    ownKeyReady: Boolean(context?.ownKey),
+    ownKeyIndex: context?.ownKeyIndex ?? null,
+    ownRtcBackendIdentity: context?.ownRtcBackendIdentity || '',
+    liveKitConnected: Boolean(liveKitConnections.get(roomId)?.room?.isConnected),
+  };
+}
+
 async function disconnectLiveKitRoom(roomId) {
+  clearLiveKitSafetyDisconnect(roomId);
   const connection = liveKitConnections.get(roomId);
   const context = matrixRtcContexts.get(roomId);
-  liveKitConnections.delete(roomId);
-  matrixRtcContexts.delete(roomId);
   if (connection) {
-    try { await connection.room.disconnect(); } catch {}
+    try { await connection.room.disconnect(); }
+    catch (error) { console.warn(`[LiveKit] disconnect failed room=${roomId}: ${error?.message || error}`); }
   }
   if (context?.rtcSession?.isJoined?.()) {
-    try { await context.rtcSession.leaveRoomSession(3000); } catch {}
+    let leaveConfirmed = false;
+    try {
+      leaveConfirmed = await context.rtcSession.leaveRoomSession(5000);
+      if (leaveConfirmed) {
+        console.log(`[MatrixRTC] left room=${roomId} member=${context.memberId || '?'}`);
+      } else {
+        console.warn(`[MatrixRTC] leave timed out room=${roomId}; forcing sticky membership clear`);
+      }
+    } catch (error) {
+      console.warn(`[MatrixRTC] leave failed room=${roomId}: ${error?.message || error}`);
+    }
+
+    // StickyEventMembershipManager normally clears the membership itself. If
+    // its leave request times out/fails, overwrite the same sticky key with an
+    // empty membership so this bot cannot keep the room in an active-call
+    // state and suppress the next incoming-call notification.
+    if (!leaveConfirmed && context?.client?._unstable_sendStickyEvent && context?.memberId) {
+      try {
+        await context.client._unstable_sendStickyEvent(
+          roomId,
+          60 * 60 * 1000,
+          null,
+          'org.matrix.msc4143.rtc.member',
+          { msc4354_sticky_key: context.memberId },
+        );
+        console.log(`[MatrixRTC] forced sticky membership clear room=${roomId} member=${context.memberId}`);
+      } catch (error) {
+        console.warn(`[MatrixRTC] forced sticky clear failed room=${roomId}: ${error?.message || error}`);
+      }
+    }
   }
   if (context?.rtcSession) {
-    try { await context.rtcSession.stop?.(); } catch {}
+    try { await context.rtcSession.stop?.(); }
+    catch (error) { console.warn(`[MatrixRTC] stop failed room=${roomId}: ${error?.message || error}`); }
   }
+  liveKitConnections.delete(roomId);
+  matrixRtcContexts.delete(roomId);
   return Boolean(connection || context);
+}
+
+async function disconnectAllRtcRooms() {
+  const roomIds = Array.from(new Set([
+    ...liveKitConnections.keys(),
+    ...matrixRtcContexts.keys(),
+  ]));
+  const results = [];
+  for (const roomId of roomIds) {
+    try {
+      const disconnected = await disconnectLiveKitRoom(roomId);
+      results.push({ roomId, disconnected, ok: true });
+    } catch (error) {
+      console.warn(`[RTC] cleanup failed room=${roomId}: ${error?.message || error}`);
+      results.push({ roomId, disconnected: false, ok: false, error: String(error?.message || error) });
+    }
+  }
+  return { roomIds, results };
 }
 
 async function connectLiveKitRoom(roomId, livekit, e2eeContext) {
   const existing = liveKitConnections.get(roomId);
   if (existing?.room?.isConnected && existing.memberId === livekit.memberId && existing.e2eeKeyIndex !== undefined) {
+    scheduleLiveKitSafetyDisconnect(roomId);
     return summarizeLiveKitRoom(roomId, existing);
   }
   if (existing) {
@@ -803,9 +897,16 @@ async function connectLiveKitRoom(roomId, livekit, e2eeContext) {
         encryptionType: EncryptionType.GCM,
         keyProviderOptions: {
           sharedKey: initialKey,
-          ratchetSalt: new TextEncoder().encode('LKFrameEncryptionKey'),
-          ratchetWindowSize: 16,
-          failureTolerance: -1,
+          ratchetSalt: MATRIXRTC_E2EE_RATCHET_SALT,
+          // Match the browser MatrixRTC key provider: Matrix media keys are
+          // HKDF material and use a larger rolling key ring than LiveKit's
+          // generic shared-passphrase defaults.
+          ratchetWindowSize: MATRIXRTC_E2EE_RATCHET_WINDOW_SIZE,
+          failureTolerance: MATRIXRTC_E2EE_FAILURE_TOLERANCE,
+          keyRingSize: MATRIXRTC_E2EE_KEY_RING_SIZE,
+          // rtc-node 0.13.33 does not expose this enum in its public wrapper,
+          // but rtc-ffi-bindings requires the field on KeyProviderOptions.
+          keyDerivationFunction: MATRIXRTC_E2EE_KDF_HKDF,
         },
       },
     });
@@ -824,6 +925,7 @@ async function connectLiveKitRoom(roomId, livekit, e2eeContext) {
     e2eeKeyUpdatedAt: Date.now(),
   };
   liveKitConnections.set(roomId, connection);
+  scheduleLiveKitSafetyDisconnect(roomId);
   try { room.e2eeManager?.setEnabled(true); } catch {}
   applyLiveKitOutboundKey(
     roomId,
@@ -893,6 +995,9 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1) {
     error.status = 409;
     throw error;
   }
+  // Playback is active work, so give it a fresh safety window instead of
+  // allowing an older connect timer to interrupt a later audio publish.
+  scheduleLiveKitSafetyDisconnect(roomId);
 
   const name = normalizeAudioName(audioName);
   if (!name) {
@@ -903,7 +1008,13 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1) {
 
   let wav;
   try {
-    wav = parsePcm16Wav(fs.readFileSync(audioFilePath(name)));
+    // Keep the built-in test tone consistent with GET /audio/test.wav so a
+    // fresh deployment can verify encrypted MatrixRTC playback without first
+    // mounting or uploading an audio file.
+    const wavBuffer = name === 'test'
+      ? makeTestWav()
+      : fs.readFileSync(audioFilePath(name));
+    wav = parsePcm16Wav(wavBuffer);
   } catch (e) {
     if (e?.code === 'ENOENT') {
       const error = new Error(`audio not found: ${name}.wav`);
@@ -982,6 +1093,7 @@ const server = http.createServer(async (req, res) => {
         matrixPrepare: 'POST /matrix/prepare',
         matrixToken: 'POST /matrix/token',
         matrixConnect: 'POST /matrix/connect',
+        matrixCallAudio: 'POST /matrix/call-audio',
         matrixPlayAudio: 'POST /matrix/play-audio',
         matrixLiveKitStatus: 'GET /matrix/livekit-status',
         matrixDisconnect: 'POST /matrix/disconnect',
@@ -990,6 +1102,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname === '/health') {
+    const activeRtcRoomIds = Array.from(new Set([
+      ...liveKitConnections.keys(),
+      ...matrixRtcContexts.keys(),
+    ]));
     return sendJson(res, 200, {
       ok: true,
       service: 'matrix-call-audio-bot-test',
@@ -997,6 +1113,16 @@ const server = http.createServer(async (req, res) => {
       jobs: jobs.size,
       audioDir: AUDIO_DIR,
       matrixConfigured: matrixConfigured(),
+      rtcClean: activeRtcRoomIds.length === 0,
+      activeRtcRoomCount: activeRtcRoomIds.length,
+      activeRtcRoomIds,
+      matrixRtcSafetyTimeoutMs: MATRIX_RTC_SAFETY_TIMEOUT_MS,
+      liveKitE2ee: {
+        ratchetWindowSize: MATRIXRTC_E2EE_RATCHET_WINDOW_SIZE,
+        failureTolerance: MATRIXRTC_E2EE_FAILURE_TOLERANCE,
+        keyRingSize: MATRIXRTC_E2EE_KEY_RING_SIZE,
+        keyDerivationFunction: 'HKDF',
+      },
       now: new Date().toISOString(),
     });
   }
@@ -1182,6 +1308,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/matrix/connect') {
     if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    let connectRoomId = '';
     try {
       const body = await readJson(req);
       const session = await ensureMatrixSession();
@@ -1190,6 +1317,7 @@ const server = http.createServer(async (req, res) => {
         roomId: body.roomId,
         targetUserId: body.targetUserId,
       });
+      connectRoomId = selected.roomId;
       const membership = await matrixRoomMembership(session, selected.roomId);
       const capabilities = await requireLatestMatrixRtcServerFeatures(session);
       const rtc = await discoverMatrixRtcTransport(session);
@@ -1228,6 +1356,12 @@ const server = http.createServer(async (req, res) => {
         note: 'MatrixRTC membership, media-key management and LiveKit E2EE are active. Audio can now be published encrypted.',
       });
     } catch (e) {
+      // Membership is joined before the LiveKit E2EE connect. If a later
+      // stage fails, leave immediately so this bot does not keep the room in
+      // an active-call state and suppress the next fresh ringing notification.
+      if (connectRoomId && (matrixRtcContexts.has(connectRoomId) || liveKitConnections.has(connectRoomId))) {
+        await disconnectLiveKitRoom(connectRoomId).catch(() => {});
+      }
       return sendJson(res, e.status || 502, {
         ok: false,
         error: String(e.message || e),
@@ -1249,17 +1383,118 @@ const server = http.createServer(async (req, res) => {
       });
       const audio = normalizeAudioName(body.audio || 'alarm');
       const repeat = Math.max(1, Math.min(10, Number(body.repeat || 1)));
-      const playback = await publishWavToLiveKit(selected.roomId, audio, repeat);
+      const hangupAfterPlay = body.hangupAfterPlay !== false;
+      const requestedHangupDelayMs = Number(body.hangupDelayMs);
+      const hangupDelayMs = Number.isFinite(requestedHangupDelayMs)
+        ? Math.max(0, Math.min(5000, Math.round(requestedHangupDelayMs)))
+        : 600;
+      let playback;
+      try {
+        playback = await publishWavToLiveKit(selected.roomId, audio, repeat);
+      } catch (error) {
+        // Playback failures must not strand a sticky MatrixRTC membership.
+        if (hangupAfterPlay) await disconnectLiveKitRoom(selected.roomId).catch(() => {});
+        throw error;
+      }
+
+      let hungUp = false;
+      if (hangupAfterPlay) {
+        // Let the final encrypted audio packets leave the sender before disconnecting.
+        if (hangupDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, hangupDelayMs));
+        }
+        hungUp = await disconnectLiveKitRoom(selected.roomId);
+      }
 
       return sendJson(res, 200, {
         ok: true,
-        status: 'audio_played',
+        status: hangupAfterPlay ? 'audio_played_and_hung_up' : 'audio_played',
         roomId: selected.roomId,
         selectedBy: selected.selectedBy,
         playback,
-        connection: summarizeLiveKitRoom(selected.roomId, liveKitConnections.get(selected.roomId)),
+        hangupAfterPlay,
+        hangupDelayMs: hangupAfterPlay ? hangupDelayMs : 0,
+        hungUp,
+        connection: hangupAfterPlay
+          ? null
+          : summarizeLiveKitRoom(selected.roomId, liveKitConnections.get(selected.roomId)),
       });
     } catch (e) {
+      return sendJson(res, e.status || 502, {
+        ok: false,
+        error: String(e.message || e),
+        candidates: e.candidates || undefined,
+        capabilities: e.capabilities || undefined,
+        details: e.body || undefined,
+      });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/matrix/call-audio') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    let selectedRoomId = '';
+    try {
+      const body = await readJson(req);
+      const session = await ensureMatrixSession();
+      const autoJoin = await matrixAutoJoinInvites(session);
+      const selected = await discoverJoinedRoom(session, {
+        roomId: body.roomId,
+        targetUserId: body.targetUserId,
+      });
+      selectedRoomId = selected.roomId;
+
+      const audio = normalizeAudioName(body.audio || 'alarm');
+      const repeat = Math.max(1, Math.min(10, Number(body.repeat || 1)));
+      if (!audio) {
+        const error = new Error('invalid audio name');
+        error.status = 400;
+        throw error;
+      }
+      const requestedHangupDelayMs = Number(body.hangupDelayMs);
+      const hangupDelayMs = Number.isFinite(requestedHangupDelayMs)
+        ? Math.max(0, Math.min(5000, Math.round(requestedHangupDelayMs)))
+        : 600;
+
+      const capabilities = await requireLatestMatrixRtcServerFeatures(session);
+      const rtc = await discoverMatrixRtcTransport(session);
+      const e2eeContext = await ensureMatrixRtcE2ee(session, selected.roomId, rtc.transport);
+      const openId = await requestMatrixOpenId(session);
+      const livekit = await requestLatestLiveKitToken(rtc.transport, session, selected.roomId, openId, {
+        slotId: MATRIX_RTC_SLOT_ID,
+        memberId: e2eeContext.memberId,
+      });
+      const connection = await connectLiveKitRoom(selected.roomId, livekit, e2eeContext);
+      const playback = await publishWavToLiveKit(selected.roomId, audio, repeat);
+
+      if (hangupDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, hangupDelayMs));
+      }
+      const hungUp = await disconnectLiveKitRoom(selected.roomId);
+
+      return sendJson(res, 200, {
+        ok: true,
+        status: 'connected_played_and_hung_up',
+        roomId: selected.roomId,
+        selectedBy: selected.selectedBy,
+        autoJoin,
+        playback,
+        hangupDelayMs,
+        hungUp,
+        connectionBeforeHangup: connection,
+        rtc: {
+          protocol: 'latest_matrixrtc',
+          capabilities,
+          discovery: rtc.discovery,
+          membership: 'msc4143_msc4354_sticky',
+          authorization: 'msc4195_get_token',
+          slotId: livekit.slotId,
+          memberId: livekit.memberId,
+        },
+      });
+    } catch (e) {
+      if (selectedRoomId && (matrixRtcContexts.has(selectedRoomId) || liveKitConnections.has(selectedRoomId))) {
+        await disconnectLiveKitRoom(selectedRoomId).catch(() => {});
+      }
       return sendJson(res, e.status || 502, {
         ok: false,
         error: String(e.message || e),
@@ -1275,10 +1510,23 @@ const server = http.createServer(async (req, res) => {
     const connections = Array.from(liveKitConnections.entries()).map(([roomId, connection]) =>
       summarizeLiveKitRoom(roomId, connection)
     );
+    const rtcContexts = Array.from(matrixRtcContexts.entries()).map(([roomId, context]) =>
+      summarizeMatrixRtcContext(roomId, context)
+    );
+    const activeRoomIds = Array.from(new Set([
+      ...liveKitConnections.keys(),
+      ...matrixRtcContexts.keys(),
+    ]));
     return sendJson(res, 200, {
       ok: true,
-      count: connections.length,
+      clean: activeRoomIds.length === 0,
+      activeRoomCount: activeRoomIds.length,
+      activeRoomIds,
+      livekitConnectionCount: connections.length,
+      matrixRtcContextCount: rtcContexts.length,
+      matrixRtcJoinedCount: rtcContexts.filter((item) => item.joined).length,
       connections,
+      rtcContexts,
     });
   }
 
@@ -1292,9 +1540,15 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { ok: true, disconnected, roomId });
       }
 
-      const roomIds = Array.from(liveKitConnections.keys());
-      for (const id of roomIds) await disconnectLiveKitRoom(id);
-      return sendJson(res, 200, { ok: true, disconnected: roomIds.length, roomIds });
+      // A failed LiveKit connect can still leave a MatrixRTC context behind.
+      // Disconnect the union so sticky membership is always released.
+      const cleanup = await disconnectAllRtcRooms();
+      return sendJson(res, 200, {
+        ok: true,
+        disconnected: cleanup.roomIds.length,
+        roomIds: cleanup.roomIds,
+        results: cleanup.results,
+      });
     } catch (e) {
       return sendJson(res, 500, { ok: false, error: String(e.message || e) });
     }
@@ -1375,4 +1629,43 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`matrix-call-audio-bot-test listening on 0.0.0.0:${PORT}`);
   console.log(`audio directory: ${AUDIO_DIR}`);
   console.log(`matrix configured: ${matrixConfigured() ? 'yes' : 'no'}`);
+  console.log(`MatrixRTC safety timeout: ${MATRIX_RTC_SAFETY_TIMEOUT_MS}ms`);
+  console.log(`LiveKit E2EE: HKDF keyRing=${MATRIXRTC_E2EE_KEY_RING_SIZE} ratchetWindow=${MATRIXRTC_E2EE_RATCHET_WINDOW_SIZE}`);
 });
+
+let shutdownStarted = false;
+async function gracefulShutdown(signal) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  console.log(`[Shutdown] ${signal}: leaving all MatrixRTC/LiveKit rooms`);
+
+  try { server.close(); } catch {}
+
+  const forceExit = setTimeout(() => {
+    console.error('[Shutdown] RTC cleanup exceeded 8s; forcing exit');
+    process.exit(1);
+  }, 8000);
+  forceExit.unref?.();
+
+  try {
+    const cleanup = await disconnectAllRtcRooms();
+    if (matrixRtcClientPromise) {
+      try {
+        const client = await matrixRtcClientPromise;
+        client?.stopClient?.();
+      } catch (error) {
+        console.warn(`[Shutdown] Matrix client stop failed: ${error?.message || error}`);
+      }
+    }
+    clearTimeout(forceExit);
+    console.log(`[Shutdown] complete rooms=${cleanup.roomIds.length}`);
+    process.exit(0);
+  } catch (error) {
+    clearTimeout(forceExit);
+    console.error(`[Shutdown] cleanup failed: ${error?.message || error}`);
+    process.exit(1);
+  }
+}
+
+process.once('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
+process.once('SIGINT', () => { void gracefulShutdown('SIGINT'); });
