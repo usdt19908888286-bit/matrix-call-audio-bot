@@ -335,6 +335,32 @@ async function matrixRoomState(session, roomId) {
   return Array.isArray(state) ? state : [];
 }
 
+async function matrixRecentRtcNotifications(session, roomId, limit = 20) {
+  const room = encodeURIComponent(roomId);
+  const data = await matrixRequest(
+    'GET',
+    `/_matrix/client/v3/rooms/${room}/messages?dir=b&limit=${Math.max(1, Math.min(100, Number(limit) || 20))}`,
+    undefined,
+    session.accessToken,
+  );
+  const chunk = Array.isArray(data?.chunk) ? data.chunk : [];
+  return chunk
+    .filter((event) => event?.type === 'org.matrix.msc4075.rtc.notification')
+    .map((event) => ({
+      eventId: event.event_id || '',
+      sender: event.sender || '',
+      originServerTs: Number(event.origin_server_ts || 0) || null,
+      senderTs: Number(event?.content?.sender_ts || 0) || null,
+      ageMs: Number(event?.content?.sender_ts || event.origin_server_ts || 0)
+        ? Math.max(0, Date.now() - Number(event?.content?.sender_ts || event.origin_server_ts || 0))
+        : null,
+      notificationType: event?.content?.notification_type || '',
+      intent: event?.content?.['m.call.intent'] || '',
+      lifetime: Number(event?.content?.lifetime || 0) || null,
+      relatesToEventId: event?.content?.['m.relates_to']?.event_id || '',
+    }));
+}
+
 async function matrixJoinedMembers(session, roomId) {
   const room = encodeURIComponent(roomId);
   const data = await matrixRequest('GET', `/_matrix/client/v3/rooms/${room}/joined_members`, undefined, session.accessToken);
@@ -420,6 +446,7 @@ async function matrixRoomSummary(session, roomId, includeMembers = false) {
   const nameEvent = state.find((e) => e?.type === 'm.room.name' && e?.content?.name);
   const aliasEvent = state.find((e) => e?.type === 'm.room.canonical_alias' && e?.content?.alias);
   const rtcEvents = await activeRtcEvents(session, roomId);
+  const recentRtcNotifications = await matrixRecentRtcNotifications(session, roomId, 50).catch(() => []);
   const stickyRtcMembers = rtcEvents.map((event) => {
     const content = event?.getContent?.() || {};
     return {
@@ -465,6 +492,7 @@ async function matrixRoomSummary(session, roomId, includeMembers = false) {
     rtcMemberCount: stickyRtcMembers.length,
     stickyRtcMembers,
     legacyRtcMembers,
+    recentRtcNotifications,
   };
 
   if (includeMembers) {
@@ -961,11 +989,12 @@ async function disconnectLiveKitRoom(roomId) {
       console.warn(`[MatrixRTC] leave failed room=${roomId}: ${error?.message || error}`);
     }
 
-    // StickyEventMembershipManager normally clears the membership itself. If
-    // its leave request times out/fails, overwrite the same sticky key with an
-    // empty membership so this bot cannot keep the room in an active-call
-    // state and suppress the next incoming-call notification.
-    if (!leaveConfirmed && context?.client?._unstable_sendStickyEvent && context?.memberId) {
+    // Do not trust leaveRoomSession() alone. In practice it may report success
+    // while the MSC4354 sticky membership is still visible for a short period,
+    // which makes Element treat the room as an already-active call and suppress
+    // the next ring notification. Always overwrite our exact sticky key with an
+    // empty membership after leave so the Audio Bot cannot keep m.call#ROOM alive.
+    if (context?.client?._unstable_sendStickyEvent && context?.memberId) {
       try {
         await context.client._unstable_sendStickyEvent(
           roomId,
@@ -974,9 +1003,12 @@ async function disconnectLiveKitRoom(roomId) {
           'org.matrix.msc4143.rtc.member',
           { msc4354_sticky_key: context.memberId },
         );
-        console.log(`[MatrixRTC] forced sticky membership clear room=${roomId} member=${context.memberId}`);
+        console.log(`[MatrixRTC] sticky membership cleared room=${roomId} member=${context.memberId} leaveConfirmed=${leaveConfirmed}`);
+        // Give the local sync/store a moment to observe the sticky clear before
+        // tearing down the MatrixRTC session object.
+        await new Promise((resolve) => setTimeout(resolve, 300));
       } catch (error) {
-        console.warn(`[MatrixRTC] forced sticky clear failed room=${roomId}: ${error?.message || error}`);
+        console.warn(`[MatrixRTC] sticky clear failed room=${roomId}: ${error?.message || error}`);
       }
     }
   }
