@@ -796,18 +796,62 @@ function applyLiveKitOutboundKey(roomId, key, keyIndex, rtcBackendIdentity) {
   if (localIdentity && rtcBackendIdentity && localIdentity !== rtcBackendIdentity) {
     console.warn(`[E2EE] LiveKit identity mismatch local=${localIdentity} matrix=${rtcBackendIdentity}`);
   }
+
+  let exportedKeyMatches = null;
+  let exportedKeyBytes = null;
+  let exportError = '';
+  if (typeof provider.exportKey === 'function') {
+    try {
+      const exported = provider.exportKey(participantIdentity, keyIndex);
+      exportedKeyBytes = exported?.length ?? 0;
+      exportedKeyMatches = Buffer.from(exported || []).equals(Buffer.from(raw));
+    } catch (error) {
+      exportError = String(error?.message || error);
+    }
+  }
+
+  try { manager.setEnabled(true); } catch {}
+
+  let matchedCryptors = 0;
+  const beforeCryptors = (manager.frameCryptors?.() || []).map((cryptor) => ({
+    participantIdentity: cryptor.participantIdentity || '',
+    enabled: Boolean(cryptor.enabled),
+    keyIndex: Number(cryptor.keyIndex ?? -1),
+  }));
+
   for (const cryptor of manager.frameCryptors?.() || []) {
     if (cryptor.participantIdentity === participantIdentity || cryptor.participantIdentity === localIdentity) {
+      matchedCryptors += 1;
       try { cryptor.setKeyIndex(keyIndex); } catch {}
       try { cryptor.setEnabled(true); } catch {}
     }
   }
-  try { manager.setEnabled(true); } catch {}
+
+  const afterCryptors = (manager.frameCryptors?.() || []).map((cryptor) => ({
+    participantIdentity: cryptor.participantIdentity || '',
+    enabled: Boolean(cryptor.enabled),
+    keyIndex: Number(cryptor.keyIndex ?? -1),
+  }));
 
   connection.e2eeKeyIndex = keyIndex;
   connection.e2eeRtcBackendIdentity = participantIdentity;
   connection.e2eeKeyUpdatedAt = Date.now();
+  connection.e2eeDiagnostics = {
+    managerEnabled: Boolean(manager.enabled),
+    participantIdentity,
+    localIdentity,
+    rawKeyBytes: raw.length,
+    exportedKeyBytes,
+    exportedKeyMatches,
+    exportError: exportError || undefined,
+    matchedCryptors,
+    beforeCryptors,
+    afterCryptors,
+  };
+
   console.log(`[E2EE] LiveKit participant key applied index=${keyIndex} participant=${participantIdentity} bytes=${raw.length}`);
+  console.log(`[E2EE] key roundtrip matches=${exportedKeyMatches} exportedBytes=${exportedKeyBytes ?? 'n/a'} managerEnabled=${Boolean(manager.enabled)}`);
+  console.log(`[E2EE] frame cryptors matched=${matchedCryptors} before=${JSON.stringify(beforeCryptors)} after=${JSON.stringify(afterCryptors)}`);
   return true;
 }
 
@@ -1517,6 +1561,8 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1) {
       totalDurationMs: wav.durationMs * loops,
       trackSid: publication?.sid || track.sid || null,
       trackName: track.name || `audio-${name}`,
+      publicationEncryptionType: publication?.encryptionType ?? null,
+      e2eeSender: connection.e2eeDiagnostics || null,
     };
   } finally {
     try { await track.close(); } catch {}
