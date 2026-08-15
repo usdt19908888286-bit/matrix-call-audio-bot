@@ -6,7 +6,6 @@ const path = require('path');
 const PORT = Number(process.env.PORT || 3000);
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
-
 const MATRIX_HOMESERVER = String(process.env.MATRIX_HOMESERVER || '').replace(/\/$/, '');
 const MATRIX_USER_ID = String(process.env.MATRIX_USER_ID || '').trim();
 const MATRIX_PASSWORD = String(process.env.MATRIX_PASSWORD || '');
@@ -49,30 +48,6 @@ function authorized(req) {
   if (!SECRET) return true;
   const auth = req.headers.authorization || '';
   return auth === `Bearer ${SECRET}` || req.headers['x-audio-bot-secret'] === SECRET;
-}
-
-async function fetchJson(url, options = {}, timeoutMs = 12000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, { ...options, signal: controller.signal });
-    const text = await response.text();
-    let data = {};
-    if (text) {
-      try { data = JSON.parse(text); }
-      catch { data = { raw: text }; }
-    }
-    if (!response.ok) {
-      const detail = data.error || data.errcode || data.raw || response.statusText;
-      const error = new Error(`HTTP ${response.status}: ${detail}`);
-      error.status = response.status;
-      error.data = data;
-      throw error;
-    }
-    return data;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 function makeTestWav({ seconds = 2, frequency = 880, sampleRate = 16000 } = {}) {
@@ -142,30 +117,49 @@ function matrixConfigured() {
   return Boolean(MATRIX_HOMESERVER && MATRIX_USER_ID && (MATRIX_ACCESS_TOKEN || MATRIX_PASSWORD));
 }
 
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let body = {};
+  if (text) {
+    try { body = JSON.parse(text); }
+    catch { body = { raw: text }; }
+  }
+  if (!response.ok) {
+    const message = body?.error || body?.errcode || body?.raw || `HTTP ${response.status}`;
+    const error = new Error(`${message} (HTTP ${response.status})`);
+    error.status = response.status;
+    error.body = body;
+    throw error;
+  }
+  return body;
+}
+
 async function matrixRequest(method, pathname, body, accessToken) {
   if (!MATRIX_HOMESERVER) throw new Error('MATRIX_HOMESERVER is not configured');
   const headers = { accept: 'application/json' };
-  if (body !== undefined) headers['content-type'] = 'application/json';
   if (accessToken) headers.authorization = `Bearer ${accessToken}`;
-
-  return fetchJson(`${MATRIX_HOMESERVER}${pathname}`, {
-    method,
-    headers,
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  const options = { method, headers };
+  if (body !== undefined) {
+    headers['content-type'] = 'application/json';
+    options.body = JSON.stringify(body);
+  }
+  return fetchJson(`${MATRIX_HOMESERVER}${pathname}`, options);
 }
 
 async function ensureMatrixSession() {
   if (!matrixConfigured()) {
-    throw new Error('Matrix is not configured. Set MATRIX_HOMESERVER, MATRIX_USER_ID and MATRIX_ACCESS_TOKEN or MATRIX_PASSWORD.');
+    throw new Error('Matrix is not configured. Set MATRIX_HOMESERVER, MATRIX_USER_ID and MATRIX_PASSWORD or MATRIX_ACCESS_TOKEN.');
   }
 
   if (matrixSession?.accessToken) {
     try {
       const who = await matrixRequest('GET', '/_matrix/client/v3/account/whoami', undefined, matrixSession.accessToken);
-      matrixSession.userId = who.user_id || matrixSession.userId;
-      matrixSession.deviceId = who.device_id || matrixSession.deviceId;
-      return matrixSession;
+      if (who.user_id) {
+        matrixSession.userId = who.user_id;
+        matrixSession.deviceId = who.device_id || matrixSession.deviceId || MATRIX_DEVICE_ID;
+        return matrixSession;
+      }
     } catch {
       matrixSession = null;
     }
@@ -237,6 +231,117 @@ async function matrixRoomMembership(session, roomId) {
   );
 }
 
+async function matrixJoinedRooms(session) {
+  const data = await matrixRequest('GET', '/_matrix/client/v3/joined_rooms', undefined, session.accessToken);
+  return Array.isArray(data.joined_rooms) ? data.joined_rooms : [];
+}
+
+async function matrixRoomState(session, roomId) {
+  const room = encodeURIComponent(roomId);
+  const state = await matrixRequest('GET', `/_matrix/client/v3/rooms/${room}/state`, undefined, session.accessToken);
+  return Array.isArray(state) ? state : [];
+}
+
+async function matrixJoinedMembers(session, roomId) {
+  const room = encodeURIComponent(roomId);
+  const data = await matrixRequest('GET', `/_matrix/client/v3/rooms/${room}/joined_members`, undefined, session.accessToken);
+  return data && typeof data.joined === 'object' && data.joined ? data.joined : {};
+}
+
+function activeRtcEvents(state) {
+  const now = Date.now();
+  return state.filter((event) => {
+    if (!event || !['org.matrix.msc3401.call.member', 'm.call.member'].includes(event.type)) return false;
+    const content = event.content;
+    if (!content || typeof content !== 'object' || !Object.keys(content).length) return false;
+    if (content.application && content.application !== 'm.call') return false;
+    const expires = Number(content.expires || 0);
+    const origin = Number(event.origin_server_ts || 0);
+    if (expires > 0 && origin > 0 && origin + expires < now) return false;
+    return Boolean(content.focus_active || content.foci_preferred || content.membershipID || content.device_id);
+  });
+}
+
+async function matrixRoomSummary(session, roomId, includeMembers = false) {
+  const state = await matrixRoomState(session, roomId);
+  const nameEvent = state.find((e) => e?.type === 'm.room.name' && e?.content?.name);
+  const aliasEvent = state.find((e) => e?.type === 'm.room.canonical_alias' && e?.content?.alias);
+  const rtcEvents = activeRtcEvents(state);
+  const summary = {
+    roomId,
+    name: nameEvent?.content?.name || '',
+    alias: aliasEvent?.content?.alias || '',
+    rtcActive: rtcEvents.length > 0,
+    rtcMemberCount: rtcEvents.length,
+  };
+
+  if (includeMembers) {
+    const joined = await matrixJoinedMembers(session, roomId);
+    summary.joinedMemberCount = Object.keys(joined).length;
+    summary.joinedUserIds = Object.keys(joined);
+  }
+  return summary;
+}
+
+async function discoverJoinedRoom(session, { roomId = '', targetUserId = '' } = {}) {
+  const explicit = String(roomId || '').trim();
+  if (explicit) {
+    if (!explicit.startsWith('!') || !explicit.includes(':')) {
+      const error = new Error('invalid Matrix roomId');
+      error.status = 400;
+      throw error;
+    }
+    await matrixRoomMembership(session, explicit);
+    return { roomId: explicit, selectedBy: 'explicit_room_id', candidates: [] };
+  }
+
+  const joinedRooms = await matrixJoinedRooms(session);
+  if (!joinedRooms.length) {
+    const error = new Error('audio-bot has not joined any Matrix rooms');
+    error.status = 409;
+    throw error;
+  }
+
+  const target = String(targetUserId || '').trim();
+  const summaries = [];
+  for (const id of joinedRooms) {
+    try {
+      summaries.push(await matrixRoomSummary(session, id, Boolean(target)));
+    } catch (e) {
+      summaries.push({ roomId: id, error: String(e.message || e), rtcActive: false, rtcMemberCount: 0 });
+    }
+  }
+
+  if (target) {
+    const matches = summaries.filter((r) => Array.isArray(r.joinedUserIds) && r.joinedUserIds.includes(target));
+    if (matches.length === 1) return { roomId: matches[0].roomId, selectedBy: 'target_user', candidates: summaries };
+    if (matches.length > 1) {
+      const activeMatches = matches.filter((r) => r.rtcActive);
+      if (activeMatches.length === 1) return { roomId: activeMatches[0].roomId, selectedBy: 'target_user_active_rtc', candidates: summaries };
+      const error = new Error(`multiple joined rooms contain target user ${target}`);
+      error.status = 409;
+      error.candidates = matches;
+      throw error;
+    }
+  }
+
+  const active = summaries.filter((r) => r.rtcActive);
+  if (active.length === 1) return { roomId: active[0].roomId, selectedBy: 'active_rtc_room', candidates: summaries };
+  if (active.length > 1) {
+    const error = new Error('multiple active MatrixRTC rooms found');
+    error.status = 409;
+    error.candidates = active;
+    throw error;
+  }
+
+  if (summaries.length === 1) return { roomId: summaries[0].roomId, selectedBy: 'only_joined_room', candidates: summaries };
+
+  const error = new Error('unable to choose one Matrix room automatically; no active RTC room was found');
+  error.status = 409;
+  error.candidates = summaries;
+  throw error;
+}
+
 async function requestMatrixOpenId(session) {
   const user = encodeURIComponent(session.userId);
   return matrixRequest(
@@ -269,7 +374,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       service: 'matrix-call-audio-bot-test',
-      mode: 'matrix-rtc-stage-1',
+      mode: 'matrix-rtc-stage-1-auto-room',
       audioDir: AUDIO_DIR,
       endpoints: {
         health: 'GET /health',
@@ -277,6 +382,7 @@ const server = http.createServer(async (req, res) => {
         createJob: 'POST /play',
         jobStatus: 'GET /jobs/:id',
         matrixStatus: 'GET /matrix/status',
+        matrixRooms: 'GET /matrix/rooms',
         matrixPrepare: 'POST /matrix/prepare',
       },
     });
@@ -300,6 +406,7 @@ const server = http.createServer(async (req, res) => {
       const session = await ensureMatrixSession();
       const rtc = await discoverMatrixRtcFocus(session.userId);
       const jwtServiceHealth = await matrixRtcJwtHealth(rtc.focus);
+      const joinedRooms = await matrixJoinedRooms(session);
 
       return sendJson(res, 200, {
         ok: true,
@@ -310,6 +417,7 @@ const server = http.createServer(async (req, res) => {
           deviceId: session.deviceId,
           authSource: session.source,
           serverName: rtc.serverName,
+          joinedRoomCount: joinedRooms.length,
         },
         rtc: {
           focus: {
@@ -325,24 +433,47 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (req.method === 'GET' && url.pathname === '/matrix/rooms') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    try {
+      const session = await ensureMatrixSession();
+      const joinedRooms = await matrixJoinedRooms(session);
+      const rooms = [];
+      for (const roomId of joinedRooms) {
+        try {
+          rooms.push(await matrixRoomSummary(session, roomId, true));
+        } catch (e) {
+          rooms.push({ roomId, error: String(e.message || e) });
+        }
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        count: rooms.length,
+        rooms,
+      });
+    } catch (e) {
+      return sendJson(res, 502, { ok: false, error: String(e.message || e) });
+    }
+  }
+
   if (req.method === 'POST' && url.pathname === '/matrix/prepare') {
     if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
     try {
       const body = await readJson(req);
-      const roomId = String(body.roomId || '').trim();
-      if (!roomId.startsWith('!') || !roomId.includes(':')) {
-        return sendJson(res, 400, { ok: false, error: 'valid Matrix roomId is required' });
-      }
-
       const session = await ensureMatrixSession();
-      const membership = await matrixRoomMembership(session, roomId);
+      const selected = await discoverJoinedRoom(session, {
+        roomId: body.roomId,
+        targetUserId: body.targetUserId,
+      });
+      const membership = await matrixRoomMembership(session, selected.roomId);
       const rtc = await discoverMatrixRtcFocus(session.userId);
       const openId = await requestMatrixOpenId(session);
 
       return sendJson(res, 200, {
         ok: true,
         status: 'matrix_rtc_ready',
-        roomId,
+        roomId: selected.roomId,
+        selectedBy: selected.selectedBy,
         matrix: {
           userId: session.userId,
           deviceId: session.deviceId,
@@ -360,10 +491,14 @@ const server = http.createServer(async (req, res) => {
           matrix_server_name: openId.matrix_server_name,
           token_type: openId.token_type,
         },
-        note: 'Matrix auth, room membership, RTC focus discovery and OpenID are ready. LiveKit join is the next stage.',
+        note: 'Room was discovered automatically. Matrix auth, membership, RTC focus discovery and OpenID are ready. LiveKit join is the next stage.',
       });
     } catch (e) {
-      return sendJson(res, 502, { ok: false, error: String(e.message || e) });
+      return sendJson(res, e.status || 502, {
+        ok: false,
+        error: String(e.message || e),
+        candidates: e.candidates || undefined,
+      });
     }
   }
 
@@ -411,7 +546,7 @@ const server = http.createServer(async (req, res) => {
         repeat,
         createdAt: now,
         updatedAt: now,
-        note: 'Audio file validated and ready. MatrixRTC stage 1 is available through /matrix/status and /matrix/prepare.',
+        note: 'Audio file validated and ready. MatrixRTC room auto-discovery is available through /matrix/prepare.',
       };
       jobs.set(id, job);
 
@@ -441,5 +576,5 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`matrix-call-audio-bot-test listening on 0.0.0.0:${PORT}`);
   console.log(`audio directory: ${AUDIO_DIR}`);
-  console.log(`matrix configured: ${matrixConfigured()}`);
+  console.log(`matrix configured: ${matrixConfigured() ? 'yes' : 'no'}`);
 });
