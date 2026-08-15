@@ -744,22 +744,34 @@ function applyLiveKitOutboundKey(roomId, key, keyIndex, rtcBackendIdentity) {
   const connection = liveKitConnections.get(roomId);
   const manager = connection?.room?.e2eeManager;
   const provider = manager?.keyProvider;
-  if (!manager || !provider || typeof provider.setSharedKey !== 'function') return false;
+  if (!manager || !provider || typeof provider.setKey !== 'function') return false;
 
   const raw = key instanceof Uint8Array ? key : new Uint8Array(key);
-  provider.setSharedKey(raw, keyIndex);
   const localIdentity = connection.room.localParticipant?.identity || '';
+  const participantIdentity = String(rtcBackendIdentity || localIdentity || '').trim();
+  if (!participantIdentity) return false;
+
+  // Match the known-good browser implementation in web_call/src/viewer.js:
+  // MatrixRTC media keys are per participant (rtcBackendIdentity), not a room
+  // shared key. patch-livekit-node-e2ee.cjs restores the raw key parameter that
+  // rtc-node's JS wrapper currently omits from KeyProvider.setKey().
+  provider.setKey(participantIdentity, raw, keyIndex);
+
+  if (localIdentity && rtcBackendIdentity && localIdentity !== rtcBackendIdentity) {
+    console.warn(`[E2EE] LiveKit identity mismatch local=${localIdentity} matrix=${rtcBackendIdentity}`);
+  }
   for (const cryptor of manager.frameCryptors?.() || []) {
-    if (!localIdentity || cryptor.participantIdentity === localIdentity) {
+    if (cryptor.participantIdentity === participantIdentity || cryptor.participantIdentity === localIdentity) {
       try { cryptor.setKeyIndex(keyIndex); } catch {}
+      try { cryptor.setEnabled(true); } catch {}
     }
   }
   try { manager.setEnabled(true); } catch {}
 
   connection.e2eeKeyIndex = keyIndex;
-  connection.e2eeRtcBackendIdentity = rtcBackendIdentity || connection.e2eeRtcBackendIdentity || '';
+  connection.e2eeRtcBackendIdentity = participantIdentity;
   connection.e2eeKeyUpdatedAt = Date.now();
-  console.log(`[E2EE] LiveKit outbound key applied index=${keyIndex} participant=${rtcBackendIdentity || localIdentity || '?'}`);
+  console.log(`[E2EE] LiveKit participant key applied index=${keyIndex} participant=${participantIdentity} bytes=${raw.length}`);
   return true;
 }
 
@@ -1293,16 +1305,13 @@ async function connectLiveKitRoom(roomId, livekit, e2eeContext) {
       encryption: {
         encryptionType: EncryptionType.GCM,
         keyProviderOptions: {
-          sharedKey: initialKey,
+          // Match web_call/src/viewer.js MatrixKeyProvider: MatrixRTC does NOT
+          // use one room-wide shared key. The raw key is installed after connect
+          // against its rtcBackendIdentity with KeyProvider.setKey().
           ratchetSalt: MATRIXRTC_E2EE_RATCHET_SALT,
-          // Match the browser MatrixRTC key provider: Matrix media keys are
-          // HKDF material and use a larger rolling key ring than LiveKit's
-          // generic shared-passphrase defaults.
           ratchetWindowSize: MATRIXRTC_E2EE_RATCHET_WINDOW_SIZE,
           failureTolerance: MATRIXRTC_E2EE_FAILURE_TOLERANCE,
           keyRingSize: MATRIXRTC_E2EE_KEY_RING_SIZE,
-          // rtc-node 0.13.33 does not expose this enum in its public wrapper,
-          // but rtc-ffi-bindings requires the field on KeyProviderOptions.
           keyDerivationFunction: MATRIXRTC_E2EE_KDF_HKDF,
         },
       },

@@ -14,6 +14,14 @@ RUN npm ci --omit=dev \
 
 COPY . .
 
+# MatrixRTC uses a distinct E2EE key for each rtcBackendIdentity. The current
+# rtc-node JS wrapper omits the raw key argument from KeyProvider.setKey even
+# though the underlying FFI supports it, so patch the wrapper at image build.
+RUN node patch-livekit-node-e2ee.cjs
+
 EXPOSE 3000
+
+# Give the bot a chance to leave MatrixRTC sticky membership before Docker stops it.
+STOPSIGNAL SIGTERM
 
 CMD ["npm", "start"]
