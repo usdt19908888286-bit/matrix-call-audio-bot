@@ -1478,6 +1478,14 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1) {
 
   try {
     publication = await connection.room.localParticipant.publishTrack(track, options);
+    if (typeof publication?.waitForSubscription === 'function') {
+      console.log(`[LiveKit] waiting for remote subscription track=${publication?.sid || track.sid || '?'} room=${roomId}`);
+      await Promise.race([
+        publication.waitForSubscription(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out waiting for remote audio-track subscription')), 10000)),
+      ]);
+      console.log(`[LiveKit] remote subscribed track=${publication?.sid || track.sid || '?'} room=${roomId}`);
+    }
     const e2eeContext = matrixRtcContexts.get(roomId) || simpleOneToOneCalls.get(roomId);
     if (e2eeContext?.ownKey) {
       applyLiveKitOutboundKey(
