@@ -18,6 +18,10 @@ const jobs = new Map();
 let matrixSession = null;
 const liveKitConnections = new Map();
 let liveKitModulePromise = null;
+let matrixJsSdkPromise = null;
+let matrixRtcModulePromise = null;
+let matrixRtcClientPromise = null;
+const matrixRtcContexts = new Map();
 
 function sendJson(res, status, body) {
   const data = JSON.stringify(body);
@@ -451,6 +455,204 @@ async function loadLiveKitRtc() {
   return liveKitModulePromise;
 }
 
+async function loadMatrixRtcSdk() {
+  if (!matrixJsSdkPromise) {
+    matrixJsSdkPromise = import('matrix-js-sdk').catch((error) => {
+      matrixJsSdkPromise = null;
+      throw error;
+    });
+  }
+  if (!matrixRtcModulePromise) {
+    matrixRtcModulePromise = import('matrix-js-sdk/lib/matrixrtc/index.js').catch((error) => {
+      matrixRtcModulePromise = null;
+      throw error;
+    });
+  }
+  const [sdk, rtc] = await Promise.all([matrixJsSdkPromise, matrixRtcModulePromise]);
+  return { sdk, rtc };
+}
+
+async function waitForMatrixPrepared(client, sdk, timeoutMs = 20000) {
+  const current = client.getSyncState?.();
+  if (current === 'PREPARED' || current === 'SYNCING') return current;
+
+  return new Promise((resolve, reject) => {
+    let timer = null;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      client.off(sdk.ClientEvent.Sync, onSync);
+    };
+    const onSync = (state) => {
+      if (state === 'PREPARED' || state === 'SYNCING') {
+        cleanup();
+        resolve(state);
+      } else if (state === 'ERROR') {
+        cleanup();
+        reject(new Error('Matrix sync entered ERROR state'));
+      }
+    };
+    client.on(sdk.ClientEvent.Sync, onSync);
+    timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Matrix sync did not become ready within ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+}
+
+async function ensureMatrixRtcClient(session) {
+  if (!matrixRtcClientPromise) {
+    matrixRtcClientPromise = (async () => {
+      const { sdk } = await loadMatrixRtcSdk();
+      const client = sdk.createClient({
+        baseUrl: MATRIX_HOMESERVER,
+        accessToken: session.accessToken,
+        userId: session.userId,
+        deviceId: session.deviceId,
+      });
+
+      console.log('[MatrixRTC] initializing Rust Crypto for AUDIOBOT device');
+      await client.initRustCrypto({ useIndexedDB: false });
+      client.startClient({ initialSyncLimit: 20 });
+      await waitForMatrixPrepared(client, sdk);
+      console.log(`[MatrixRTC] sync ready user=${session.userId} device=${session.deviceId}`);
+      return client;
+    })().catch((error) => {
+      matrixRtcClientPromise = null;
+      throw error;
+    });
+  }
+  return matrixRtcClientPromise;
+}
+
+function applyLiveKitOutboundKey(roomId, key, keyIndex, rtcBackendIdentity) {
+  const connection = liveKitConnections.get(roomId);
+  const manager = connection?.room?.e2eeManager;
+  const provider = manager?.keyProvider;
+  if (!manager || !provider || typeof provider.setSharedKey !== 'function') return false;
+
+  const raw = key instanceof Uint8Array ? key : new Uint8Array(key);
+  provider.setSharedKey(raw, keyIndex);
+  const localIdentity = connection.room.localParticipant?.identity || '';
+  for (const cryptor of manager.frameCryptors?.() || []) {
+    if (!localIdentity || cryptor.participantIdentity === localIdentity) {
+      try { cryptor.setKeyIndex(keyIndex); } catch {}
+    }
+  }
+  try { manager.setEnabled(true); } catch {}
+
+  connection.e2eeKeyIndex = keyIndex;
+  connection.e2eeRtcBackendIdentity = rtcBackendIdentity || connection.e2eeRtcBackendIdentity || '';
+  connection.e2eeKeyUpdatedAt = Date.now();
+  console.log(`[E2EE] LiveKit outbound key applied index=${keyIndex} participant=${rtcBackendIdentity || localIdentity || '?'}`);
+  return true;
+}
+
+async function waitForOwnMatrixRtcKey(context, timeoutMs = 15000) {
+  if (context.ownKey) return context;
+  return new Promise((resolve, reject) => {
+    const waiter = { resolve, reject };
+    context.keyWaiters.add(waiter);
+    const timer = setTimeout(() => {
+      context.keyWaiters.delete(waiter);
+      reject(new Error(`MatrixRTC media key was not received within ${timeoutMs}ms`));
+    }, timeoutMs);
+    waiter.resolve = (value) => {
+      clearTimeout(timer);
+      context.keyWaiters.delete(waiter);
+      resolve(value);
+    };
+    waiter.reject = (error) => {
+      clearTimeout(timer);
+      context.keyWaiters.delete(waiter);
+      reject(error);
+    };
+  });
+}
+
+async function ensureMatrixRtcE2ee(session, roomId, focus) {
+  let context = matrixRtcContexts.get(roomId);
+  if (context?.rtcSession?.isJoined?.() && context.ownKey) return context;
+
+  const client = await ensureMatrixRtcClient(session);
+  const { rtc } = await loadMatrixRtcSdk();
+  let room = client.getRoom(roomId);
+  if (!room) {
+    await client.joinRoom(roomId);
+    room = client.getRoom(roomId);
+  }
+  if (!room) throw new Error(`MatrixRTC room is not available in matrix-js-sdk: ${roomId}`);
+
+  const rtcSession = client.matrixRTC.getRoomSession(room);
+  await rtcSession.initialMembershipCalculated;
+
+  if (!context || context.rtcSession !== rtcSession) {
+    context = {
+      client,
+      rtcSession,
+      roomId,
+      memberId: MATRIX_RTC_MEMBER_ID,
+      ownKey: null,
+      ownKeyIndex: null,
+      ownRtcBackendIdentity: '',
+      keyWaiters: new Set(),
+      keysSeen: 0,
+      joinedAt: null,
+    };
+    matrixRtcContexts.set(roomId, context);
+
+    rtcSession.on(rtc.MatrixRTCSessionEvent.EncryptionKeyChanged, (key, keyIndex, membership, rtcBackendIdentity) => {
+      const raw = key instanceof Uint8Array ? new Uint8Array(key) : new Uint8Array(key || []);
+      context.keysSeen += 1;
+      const isOwn = membership?.userId === session.userId && membership?.deviceId === session.deviceId;
+      console.log(`[E2EE] key index=${keyIndex} participant=${rtcBackendIdentity || '?'} matrix=${membership?.userId || '?'}/${membership?.deviceId || '?'} own=${isOwn}`);
+
+      if (isOwn) {
+        context.ownKey = raw;
+        context.ownKeyIndex = Number(keyIndex || 0);
+        context.ownRtcBackendIdentity = String(rtcBackendIdentity || '');
+        applyLiveKitOutboundKey(roomId, raw, context.ownKeyIndex, context.ownRtcBackendIdentity);
+        for (const waiter of Array.from(context.keyWaiters)) waiter.resolve(context);
+      }
+    });
+
+    rtcSession.on(rtc.MatrixRTCSessionEvent.MembershipsChanged, (_oldMemberships, memberships) => {
+      const ids = (memberships || []).map((m) => `${m.userId || '?'}/${m.deviceId || '?'}/${m.memberId || '?'}`).join(', ');
+      console.log(`[MatrixRTC] memberships=${memberships?.length || 0}${ids ? ` ${ids}` : ''}`);
+    });
+
+    rtcSession.on(rtc.MatrixRTCSessionEvent.MembershipManagerError, (error) => {
+      const wrapped = error instanceof Error ? error : new Error(String(error || 'MatrixRTC membership manager error'));
+      console.error('[MatrixRTC] membership manager error:', wrapped);
+      for (const waiter of Array.from(context.keyWaiters)) waiter.reject(wrapped);
+    });
+  }
+
+  if (!rtcSession.isJoined?.()) {
+    const focusObj = {
+      type: 'livekit',
+      livekit_service_url: focus.livekit_service_url,
+      livekit_alias: roomId,
+    };
+    const identity = {
+      userId: session.userId,
+      deviceId: session.deviceId,
+      memberId: MATRIX_RTC_MEMBER_ID,
+    };
+
+    rtcSession.joinRTCSession(identity, [], focusObj, {
+      callIntent: 'audio',
+      manageMediaKeys: true,
+      unstableSendStickyEvents: true,
+    });
+    context.joinedAt = Date.now();
+    console.log(`[MatrixRTC] joined user=${session.userId} device=${session.deviceId} member=${MATRIX_RTC_MEMBER_ID}`);
+  }
+
+  try { rtcSession.reemitEncryptionKeys?.(); } catch {}
+  await waitForOwnMatrixRtcKey(context);
+  return context;
+}
+
 function summarizeLiveKitRoom(roomId, connection) {
   const room = connection?.room;
   const local = room?.localParticipant;
@@ -476,30 +678,58 @@ function summarizeLiveKitRoom(roomId, connection) {
     connectedAt: connection?.connectedAt || null,
     memberId: connection?.memberId || null,
     slotId: connection?.slotId || null,
+    e2ee: {
+      enabled: Boolean(room?.e2eeManager?.enabled),
+      keyIndex: connection?.e2eeKeyIndex ?? null,
+      rtcBackendIdentity: connection?.e2eeRtcBackendIdentity || '',
+      keyUpdatedAt: connection?.e2eeKeyUpdatedAt || null,
+    },
   };
 }
 
 async function disconnectLiveKitRoom(roomId) {
   const connection = liveKitConnections.get(roomId);
-  if (!connection) return false;
+  const context = matrixRtcContexts.get(roomId);
   liveKitConnections.delete(roomId);
-  try { await connection.room.disconnect(); } catch {}
-  return true;
+  matrixRtcContexts.delete(roomId);
+  if (connection) {
+    try { await connection.room.disconnect(); } catch {}
+  }
+  if (context?.rtcSession?.isJoined?.()) {
+    try { await context.rtcSession.leaveRoomSession(3000); } catch {}
+  }
+  return Boolean(connection || context);
 }
 
-async function connectLiveKitRoom(roomId, livekit) {
+async function connectLiveKitRoom(roomId, livekit, e2eeContext) {
   const existing = liveKitConnections.get(roomId);
-  if (existing?.room?.isConnected && existing.memberId === livekit.memberId) {
+  if (existing?.room?.isConnected && existing.memberId === livekit.memberId && existing.e2eeKeyIndex !== undefined) {
     return summarizeLiveKitRoom(roomId, existing);
   }
-  if (existing) await disconnectLiveKitRoom(roomId);
+  if (existing) {
+    liveKitConnections.delete(roomId);
+    try { await existing.room.disconnect(); } catch {}
+  }
 
-  const { Room } = await loadLiveKitRtc();
+  if (!e2eeContext?.ownKey) throw new Error('MatrixRTC outbound E2EE key is not ready');
+  const { Room, EncryptionType } = await loadLiveKitRtc();
   const room = new Room();
+  const initialKey = e2eeContext.ownKey instanceof Uint8Array
+    ? e2eeContext.ownKey
+    : new Uint8Array(e2eeContext.ownKey);
+
   try {
     await room.connect(livekit.url, livekit.jwt, {
-      autoSubscribe: true,
+      autoSubscribe: false,
       dynacast: false,
+      e2ee: {
+        encryptionType: EncryptionType.GCM,
+        keyProviderOptions: {
+          sharedKey: initialKey,
+          ratchetWindowSize: 10,
+          failureTolerance: 10,
+        },
+      },
     });
   } catch (error) {
     try { await room.disconnect(); } catch {}
@@ -511,8 +741,18 @@ async function connectLiveKitRoom(roomId, livekit) {
     connectedAt: Date.now(),
     memberId: livekit.memberId,
     slotId: livekit.slotId,
+    e2eeKeyIndex: e2eeContext.ownKeyIndex ?? 0,
+    e2eeRtcBackendIdentity: e2eeContext.ownRtcBackendIdentity || '',
+    e2eeKeyUpdatedAt: Date.now(),
   };
   liveKitConnections.set(roomId, connection);
+  try { room.e2eeManager?.setEnabled(true); } catch {}
+  applyLiveKitOutboundKey(
+    roomId,
+    initialKey,
+    connection.e2eeKeyIndex,
+    connection.e2eeRtcBackendIdentity,
+  );
   return summarizeLiveKitRoom(roomId, connection);
 }
 
@@ -608,6 +848,15 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1) {
 
   try {
     publication = await connection.room.localParticipant.publishTrack(track, options);
+    const e2eeContext = matrixRtcContexts.get(roomId);
+    if (e2eeContext?.ownKey) {
+      applyLiveKitOutboundKey(
+        roomId,
+        e2eeContext.ownKey,
+        e2eeContext.ownKeyIndex ?? 0,
+        e2eeContext.ownRtcBackendIdentity,
+      );
+    }
     for (let loop = 0; loop < loops; loop++) {
       for (let start = 0; start < wav.samples.length; start += frameSampleCount) {
         const end = Math.min(start + frameSampleCount, wav.samples.length);
@@ -643,7 +892,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       service: 'matrix-call-audio-bot-test',
-      mode: 'matrix-rtc-stage-1-auto-room',
+      mode: 'matrix-rtc-e2ee-audio',
       audioDir: AUDIO_DIR,
       endpoints: {
         health: 'GET /health',
@@ -843,12 +1092,13 @@ const server = http.createServer(async (req, res) => {
       });
       const membership = await matrixRoomMembership(session, selected.roomId);
       const rtc = await discoverMatrixRtcFocus(session.userId);
+      const e2eeContext = await ensureMatrixRtcE2ee(session, selected.roomId, rtc.focus);
       const openId = await requestMatrixOpenId(session);
       const livekit = await requestModernLiveKitToken(rtc.focus, session, selected.roomId, openId, {
-        slotId: body.slotId,
-        memberId: body.memberId,
+        slotId: MATRIX_RTC_SLOT_ID,
+        memberId: e2eeContext.memberId,
       });
-      const connection = await connectLiveKitRoom(selected.roomId, livekit);
+      const connection = await connectLiveKitRoom(selected.roomId, livekit, e2eeContext);
 
       return sendJson(res, 200, {
         ok: true,
@@ -869,7 +1119,7 @@ const server = http.createServer(async (req, res) => {
           memberId: livekit.memberId,
         },
         connection,
-        note: 'The Node realtime SDK is connected to LiveKit. No audio track has been published yet.',
+        note: 'MatrixRTC membership, media-key management and LiveKit E2EE are active. Audio can now be published encrypted.',
       });
     } catch (e) {
       return sendJson(res, e.status || 502, {
