@@ -790,6 +790,39 @@ function summarizeLiveKitRoom(roomId, connection) {
   };
 }
 
+async function waitForLiveKitRemoteParticipant(roomId, timeoutMs = 45000) {
+  const startedAt = Date.now();
+  const waitMs = Math.max(0, Math.min(120000, Math.round(Number(timeoutMs) || 0)));
+
+  while (true) {
+    const connection = liveKitConnections.get(roomId);
+    if (!connection?.room?.isConnected) {
+      const error = new Error('LiveKit room disconnected while waiting for remote participant');
+      error.status = 409;
+      throw error;
+    }
+
+    const summary = summarizeLiveKitRoom(roomId, connection);
+    if (summary.remoteParticipantCount > 0) {
+      return {
+        ready: true,
+        waitedMs: Date.now() - startedAt,
+        remoteParticipantCount: summary.remoteParticipantCount,
+        remoteParticipants: summary.remoteParticipants,
+      };
+    }
+
+    const elapsed = Date.now() - startedAt;
+    if (elapsed >= waitMs) {
+      const error = new Error(`Timed out waiting for remote LiveKit participant after ${waitMs}ms`);
+      error.status = 504;
+      throw error;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
 function summarizeMatrixRtcContext(roomId, context) {
   return {
     roomId,
@@ -1454,6 +1487,10 @@ const server = http.createServer(async (req, res) => {
       const hangupDelayMs = Number.isFinite(requestedHangupDelayMs)
         ? Math.max(0, Math.min(5000, Math.round(requestedHangupDelayMs)))
         : 600;
+      const requestedWaitForRemoteMs = Number(body.waitForRemoteMs);
+      const waitForRemoteMs = Number.isFinite(requestedWaitForRemoteMs)
+        ? Math.max(0, Math.min(120000, Math.round(requestedWaitForRemoteMs)))
+        : 45000;
 
       const capabilities = await requireLatestMatrixRtcServerFeatures(session);
       const rtc = await discoverMatrixRtcTransport(session);
@@ -1464,6 +1501,7 @@ const server = http.createServer(async (req, res) => {
         memberId: e2eeContext.memberId,
       });
       const connection = await connectLiveKitRoom(selected.roomId, livekit, e2eeContext);
+      const remote = await waitForLiveKitRemoteParticipant(selected.roomId, waitForRemoteMs);
       const playback = await publishWavToLiveKit(selected.roomId, audio, repeat);
 
       if (hangupDelayMs > 0) {
@@ -1477,6 +1515,8 @@ const server = http.createServer(async (req, res) => {
         roomId: selected.roomId,
         selectedBy: selected.selectedBy,
         autoJoin,
+        remote,
+        waitForRemoteMs,
         playback,
         hangupDelayMs,
         hungUp,
