@@ -656,6 +656,42 @@ async function requestLatestLiveKitToken(transport, session, roomId, openId, opt
   };
 }
 
+async function requestLegacyLiveKitToken(transport, session, roomId, openId, options = {}) {
+  // Keep the simple 1:1 call on the same proven media authorization path as
+  // web_call/src/viewer.js. That caller uses getRoomSession()/joinRoomSession()
+  // and the legacy /sfu/get endpoint, whose LiveKit participant identity
+  // matches MatrixRTC's rtcBackendIdentity (userId:deviceId). Mixing this
+  // signaling path with MSC4195 /get_token produces a hashed LiveKit identity
+  // and breaks per-participant E2EE.
+  const base = String(transport.livekit_service_url || '').replace(/\/$/, '');
+  if (!base) throw new Error('missing livekit_service_url');
+
+  const response = await fetchJson(`${base}/sfu/get`, {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      room: roomId,
+      openid_token: openId,
+      device_id: session.deviceId,
+    }),
+  });
+
+  if (!response?.url || !response?.jwt) {
+    throw new Error('Legacy MatrixRTC authorization service returned no LiveKit url/jwt');
+  }
+
+  return {
+    url: response.url,
+    jwt: response.jwt,
+    mode: 'legacy_sfu_get',
+    slotId: MATRIX_RTC_SLOT_ID,
+    memberId: String(options.memberId || matrixRtcMemberId(session)),
+  };
+}
+
 async function loadLiveKitRtc() {
   if (!liveKitModulePromise) {
     liveKitModulePromise = import('@livekit/rtc-node').catch((error) => {
@@ -1138,8 +1174,7 @@ async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000) 
 
   const rtc = await discoverMatrixRtcTransport(session);
   const openId = await requestMatrixOpenId(session);
-  const livekit = await requestLatestLiveKitToken(rtc.transport, session, roomId, openId, {
-    slotId: MATRIX_RTC_SLOT_ID,
+  const livekit = await requestLegacyLiveKitToken(rtc.transport, session, roomId, openId, {
     memberId,
   });
   const connection = await connectLiveKitRoom(roomId, livekit, active);
@@ -1988,6 +2023,11 @@ const server = http.createServer(async (req, res) => {
         repeat,
         remote: media.remote,
         playback,
+        mediaTransport: {
+          tokenMode: media.livekit.mode,
+          localLiveKitIdentity: media.connection?.localParticipant?.identity || '',
+          livekitRoomName: media.connection?.livekitRoomName || '',
+        },
         e2ee: {
           keyIndex: media.active.ownKeyIndex ?? 0,
           rtcBackendIdentity: media.active.ownRtcBackendIdentity || '',
