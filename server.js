@@ -1434,7 +1434,7 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1) {
 
   try {
     publication = await connection.room.localParticipant.publishTrack(track, options);
-    const e2eeContext = matrixRtcContexts.get(roomId);
+    const e2eeContext = matrixRtcContexts.get(roomId) || simpleOneToOneCalls.get(roomId);
     if (e2eeContext?.ownKey) {
       applyLiveKitOutboundKey(
         roomId,
