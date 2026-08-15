@@ -8,7 +8,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
-RUN npm install --production
+RUN npm install --production \
+    && sed -i 's|from "../http-api";|from "../http-api/index.js";|g' node_modules/matrix-js-sdk/lib/oauth/index.js node_modules/matrix-js-sdk/lib/oauth/authorize.js \
+    && grep -n 'http-api/index.js' node_modules/matrix-js-sdk/lib/oauth/index.js node_modules/matrix-js-sdk/lib/oauth/authorize.js
 
 COPY . .
 
