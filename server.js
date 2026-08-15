@@ -784,7 +784,7 @@ async function waitForOwnMatrixRtcKey(context, timeoutMs = 15000) {
   });
 }
 
-async function ensureMatrixRtcE2ee(session, roomId, transport) {
+async function ensureMatrixRtcE2ee(session, roomId, transport, joinOptions = {}) {
   let context = matrixRtcContexts.get(roomId);
   if (context?.rtcSession?.isJoined?.() && context.ownKey) return context;
 
@@ -875,6 +875,7 @@ async function ensureMatrixRtcE2ee(session, roomId, transport) {
       callIntent: 'audio',
       manageMediaKeys: true,
       unstableSendStickyEvents: true,
+      ...joinOptions,
     });
     context.joinedAt = Date.now();
     console.log(`[MatrixRTC] joined MSC4143/MSC4354 sticky membership user=${session.userId} device=${session.deviceId} member=${ownMemberId}`);
@@ -1760,7 +1761,8 @@ const server = http.createServer(async (req, res) => {
 
       const capabilities = await requireLatestMatrixRtcServerFeatures(session);
       const rtc = await discoverMatrixRtcTransport(session);
-      const e2eeContext = await ensureMatrixRtcE2ee(session, selected.roomId, rtc.transport);
+      await clearStaleOwnRtcMemberships(session, selected.roomId);
+      const e2eeContext = await ensureMatrixRtcE2ee(session, selected.roomId, rtc.transport, { notificationType: 'ring' });
       const openId = await requestMatrixOpenId(session);
       const livekit = await requestLatestLiveKitToken(rtc.transport, session, selected.roomId, openId, {
         slotId: MATRIX_RTC_SLOT_ID,
