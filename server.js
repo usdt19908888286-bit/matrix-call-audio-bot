@@ -516,6 +516,126 @@ async function connectLiveKitRoom(roomId, livekit) {
   return summarizeLiveKitRoom(roomId, connection);
 }
 
+function parsePcm16Wav(fileBuffer) {
+  if (!Buffer.isBuffer(fileBuffer) || fileBuffer.length < 44) throw new Error('invalid WAV file');
+  if (fileBuffer.toString('ascii', 0, 4) !== 'RIFF' || fileBuffer.toString('ascii', 8, 12) !== 'WAVE') {
+    throw new Error('unsupported audio file: expected RIFF/WAVE');
+  }
+
+  let offset = 12;
+  let format = null;
+  let dataOffset = -1;
+  let dataSize = 0;
+
+  while (offset + 8 <= fileBuffer.length) {
+    const chunkId = fileBuffer.toString('ascii', offset, offset + 4);
+    const chunkSize = fileBuffer.readUInt32LE(offset + 4);
+    const chunkDataOffset = offset + 8;
+    if (chunkDataOffset + chunkSize > fileBuffer.length) break;
+
+    if (chunkId === 'fmt ' && chunkSize >= 16) {
+      format = {
+        audioFormat: fileBuffer.readUInt16LE(chunkDataOffset),
+        channels: fileBuffer.readUInt16LE(chunkDataOffset + 2),
+        sampleRate: fileBuffer.readUInt32LE(chunkDataOffset + 4),
+        bitsPerSample: fileBuffer.readUInt16LE(chunkDataOffset + 14),
+      };
+    } else if (chunkId === 'data') {
+      dataOffset = chunkDataOffset;
+      dataSize = chunkSize;
+    }
+
+    offset = chunkDataOffset + chunkSize + (chunkSize % 2);
+  }
+
+  if (!format || dataOffset < 0) throw new Error('invalid WAV file: missing fmt/data chunk');
+  if (format.audioFormat !== 1) throw new Error(`unsupported WAV format ${format.audioFormat}; PCM required`);
+  if (format.bitsPerSample !== 16) throw new Error(`unsupported WAV bit depth ${format.bitsPerSample}; 16-bit required`);
+  if (format.channels < 1 || format.channels > 2) throw new Error(`unsupported WAV channel count ${format.channels}`);
+
+  const pcmBytes = fileBuffer.subarray(dataOffset, dataOffset + dataSize);
+  const evenLength = pcmBytes.length - (pcmBytes.length % 2);
+  const samples = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, evenLength / 2);
+  const samplesPerChannel = Math.floor(samples.length / format.channels);
+
+  return {
+    sampleRate: format.sampleRate,
+    channels: format.channels,
+    bitsPerSample: format.bitsPerSample,
+    samples,
+    samplesPerChannel,
+    durationMs: Math.round((samplesPerChannel / format.sampleRate) * 1000),
+  };
+}
+
+async function publishWavToLiveKit(roomId, audioName, repeat = 1) {
+  const connection = liveKitConnections.get(roomId);
+  if (!connection?.room?.isConnected) {
+    const error = new Error('LiveKit room is not connected');
+    error.status = 409;
+    throw error;
+  }
+
+  const name = normalizeAudioName(audioName);
+  if (!name) {
+    const error = new Error('invalid audio name');
+    error.status = 400;
+    throw error;
+  }
+
+  let wav;
+  try {
+    wav = parsePcm16Wav(fs.readFileSync(audioFilePath(name)));
+  } catch (e) {
+    if (e?.code === 'ENOENT') {
+      const error = new Error(`audio not found: ${name}.wav`);
+      error.status = 404;
+      throw error;
+    }
+    throw e;
+  }
+
+  const { AudioFrame, AudioSource, LocalAudioTrack, TrackPublishOptions, TrackSource } = await loadLiveKitRtc();
+  const source = new AudioSource(wav.sampleRate, wav.channels);
+  const track = LocalAudioTrack.createAudioTrack(`audio-${name}`, source);
+  const options = new TrackPublishOptions();
+  options.source = TrackSource.SOURCE_MICROPHONE;
+
+  const frameSamplesPerChannel = Math.max(1, Math.round(wav.sampleRate * 0.02));
+  const frameSampleCount = frameSamplesPerChannel * wav.channels;
+  const loops = Math.max(1, Math.min(10, Number(repeat || 1)));
+  let publication = null;
+
+  try {
+    publication = await connection.room.localParticipant.publishTrack(track, options);
+    for (let loop = 0; loop < loops; loop++) {
+      for (let start = 0; start < wav.samples.length; start += frameSampleCount) {
+        const end = Math.min(start + frameSampleCount, wav.samples.length);
+        const frameData = wav.samples.subarray(start, end);
+        const actualSamplesPerChannel = Math.floor(frameData.length / wav.channels);
+        if (actualSamplesPerChannel <= 0) continue;
+        const aligned = frameData.subarray(0, actualSamplesPerChannel * wav.channels);
+        await source.captureFrame(new AudioFrame(aligned, wav.sampleRate, wav.channels, actualSamplesPerChannel));
+      }
+    }
+    await source.waitForPlayout();
+
+    return {
+      audio: name,
+      repeat: loops,
+      sampleRate: wav.sampleRate,
+      channels: wav.channels,
+      bitsPerSample: wav.bitsPerSample,
+      durationMsPerPlay: wav.durationMs,
+      totalDurationMs: wav.durationMs * loops,
+      trackSid: publication?.sid || track.sid || null,
+      trackName: track.name || `audio-${name}`,
+    };
+  } finally {
+    try { await track.close(); } catch {}
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
@@ -535,6 +655,7 @@ const server = http.createServer(async (req, res) => {
         matrixPrepare: 'POST /matrix/prepare',
         matrixToken: 'POST /matrix/token',
         matrixConnect: 'POST /matrix/connect',
+        matrixPlayAudio: 'POST /matrix/play-audio',
         matrixLiveKitStatus: 'GET /matrix/livekit-status',
         matrixDisconnect: 'POST /matrix/disconnect',
       },
@@ -749,6 +870,37 @@ const server = http.createServer(async (req, res) => {
         },
         connection,
         note: 'The Node realtime SDK is connected to LiveKit. No audio track has been published yet.',
+      });
+    } catch (e) {
+      return sendJson(res, e.status || 502, {
+        ok: false,
+        error: String(e.message || e),
+        candidates: e.candidates || undefined,
+        details: e.body || undefined,
+      });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/matrix/play-audio') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    try {
+      const body = await readJson(req);
+      const session = await ensureMatrixSession();
+      const selected = await discoverJoinedRoom(session, {
+        roomId: body.roomId,
+        targetUserId: body.targetUserId,
+      });
+      const audio = normalizeAudioName(body.audio || 'alarm');
+      const repeat = Math.max(1, Math.min(10, Number(body.repeat || 1)));
+      const playback = await publishWavToLiveKit(selected.roomId, audio, repeat);
+
+      return sendJson(res, 200, {
+        ok: true,
+        status: 'audio_played',
+        roomId: selected.roomId,
+        selectedBy: selected.selectedBy,
+        playback,
+        connection: summarizeLiveKitRoom(selected.roomId, liveKitConnections.get(selected.roomId)),
       });
     } catch (e) {
       return sendJson(res, e.status || 502, {
