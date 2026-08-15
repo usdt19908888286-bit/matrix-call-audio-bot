@@ -964,6 +964,9 @@ async function waitForLiveKitRemoteParticipant(roomId, timeoutMs = 45000) {
 
 async function stopSimpleOneToOneCall(session, roomId) {
   const active = simpleOneToOneCalls.get(roomId);
+  if (liveKitConnections.has(roomId)) {
+    await disconnectLiveKitRoom(roomId).catch(() => {});
+  }
   let left = false;
   if (active?.rtcSession?.isJoined?.()) {
     try {
@@ -995,6 +998,7 @@ async function startSimpleOneToOneCall(session, roomId) {
   if (cleared.length) await new Promise((resolve) => setTimeout(resolve, 1200));
 
   const client = await ensureMatrixRtcClient(session);
+  const { rtc: rtcModule } = await loadMatrixRtcSdk();
   let room = client.getRoom(roomId);
   if (!room) {
     await client.joinRoom(roomId);
@@ -1015,6 +1019,40 @@ async function startSimpleOneToOneCall(session, roomId) {
   const rtcSession = client.matrixRTC.getRoomSession(room);
   await rtcSession.initialMembershipCalculated;
 
+  const simpleContext = {
+    client,
+    rtcSession,
+    roomId,
+    memberId: '',
+    ownKey: null,
+    ownKeyIndex: null,
+    ownRtcBackendIdentity: '',
+    keyWaiters: new Set(),
+    keysSeen: 0,
+    startedAt: Date.now(),
+  };
+
+  rtcSession.on(rtcModule.MatrixRTCSessionEvent.EncryptionKeyChanged, (key, keyIndex, membership, rtcBackendIdentity) => {
+    const raw = key instanceof Uint8Array ? new Uint8Array(key) : new Uint8Array(key || []);
+    simpleContext.keysSeen += 1;
+    const isOwn = membership?.userId === session.userId && membership?.deviceId === session.deviceId;
+    console.log(`[1:1 E2EE] key index=${keyIndex} participant=${rtcBackendIdentity || '?'} matrix=${membership?.userId || '?'}/${membership?.deviceId || '?'} own=${isOwn}`);
+    if (!isOwn) return;
+
+    simpleContext.memberId = String(membership?.memberId || simpleContext.memberId || '');
+    simpleContext.ownKey = raw;
+    simpleContext.ownKeyIndex = Number(keyIndex || 0);
+    simpleContext.ownRtcBackendIdentity = String(rtcBackendIdentity || '');
+    applyLiveKitOutboundKey(roomId, raw, simpleContext.ownKeyIndex, simpleContext.ownRtcBackendIdentity);
+    for (const waiter of Array.from(simpleContext.keyWaiters)) waiter.resolve(simpleContext);
+  });
+
+  rtcSession.on(rtcModule.MatrixRTCSessionEvent.MembershipManagerError, (error) => {
+    const wrapped = error instanceof Error ? error : new Error(String(error || 'MatrixRTC membership manager error'));
+    console.error('[1:1] membership manager error:', wrapped);
+    for (const waiter of Array.from(simpleContext.keyWaiters)) waiter.reject(wrapped);
+  });
+
   const notificationPromise = new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('MatrixRTC ring notification was not sent within 20000ms')), 20000);
     rtcSession.once('did_send_call_notification', (notification) => {
@@ -1032,7 +1070,7 @@ async function startSimpleOneToOneCall(session, roomId) {
     callIntent: 'audio',
     manageMediaKeys: true,
   });
-  simpleOneToOneCalls.set(roomId, { rtcSession, roomId, startedAt: Date.now() });
+  simpleOneToOneCalls.set(roomId, simpleContext);
 
   try {
     const notification = await notificationPromise;
@@ -1048,6 +1086,53 @@ async function startSimpleOneToOneCall(session, roomId) {
     await stopSimpleOneToOneCall(session, roomId).catch(() => {});
     throw error;
   }
+}
+
+async function resolveSimpleCallMemberId(session, roomId, active) {
+  if (active?.memberId) return active.memberId;
+
+  const state = await matrixRoomState(session, roomId);
+  const own = state
+    .filter((event) => event?.type === 'org.matrix.msc3401.call.member')
+    .filter((event) => event?.sender === session.userId)
+    .map((event) => event?.content || {})
+    .find((content) => content?.device_id === session.deviceId && content?.membershipID);
+
+  if (own?.membershipID) {
+    active.memberId = String(own.membershipID);
+    return active.memberId;
+  }
+
+  const error = new Error('1:1 MatrixRTC membership is not visible yet');
+  error.status = 409;
+  throw error;
+}
+
+async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000) {
+  const active = simpleOneToOneCalls.get(roomId);
+  if (!active?.rtcSession?.isJoined?.()) {
+    const error = new Error('No active 1:1 call session. Call /matrix/call first and answer it before playing audio.');
+    error.status = 409;
+    throw error;
+  }
+
+  const memberId = await resolveSimpleCallMemberId(session, roomId, active);
+
+  if (!active.ownKey && typeof active.rtcSession._onRTCSessionMemberUpdate === 'function') {
+    try { await active.rtcSession._onRTCSessionMemberUpdate(); } catch {}
+  }
+  try { active.rtcSession.reemitEncryptionKeys?.(); } catch {}
+  await waitForOwnMatrixRtcKey(active, 15000);
+
+  const rtc = await discoverMatrixRtcTransport(session);
+  const openId = await requestMatrixOpenId(session);
+  const livekit = await requestLatestLiveKitToken(rtc.transport, session, roomId, openId, {
+    slotId: MATRIX_RTC_SLOT_ID,
+    memberId,
+  });
+  const connection = await connectLiveKitRoom(roomId, livekit, active);
+  const remote = await waitForLiveKitRemoteParticipant(roomId, waitForRemoteMs);
+  return { active, livekit, connection, remote };
 }
 
 function summarizeMatrixRtcContext(roomId, context) {
@@ -1846,6 +1931,69 @@ const server = http.createServer(async (req, res) => {
         ok: false,
         error: String(e.message || e),
         candidates: e.candidates || undefined,
+        details: e.body || undefined,
+      });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/matrix/call-play') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    let selectedRoomId = '';
+    try {
+      const body = await readJson(req);
+      const session = await ensureMatrixSession();
+      const selected = await discoverJoinedRoom(session, {
+        roomId: body.roomId,
+        targetUserId: body.targetUserId,
+      });
+      selectedRoomId = selected.roomId;
+
+      const audio = normalizeAudioName(body.audio || 'test');
+      const repeat = Math.max(1, Math.min(10, Number(body.repeat || 1)));
+      const requestedWaitForRemoteMs = Number(body.waitForRemoteMs);
+      const waitForRemoteMs = Number.isFinite(requestedWaitForRemoteMs)
+        ? Math.max(1000, Math.min(30000, Math.round(requestedWaitForRemoteMs)))
+        : 15000;
+      if (!audio) {
+        const error = new Error('invalid audio name');
+        error.status = 400;
+        throw error;
+      }
+
+      const media = await connectSimpleCallMedia(session, selected.roomId, waitForRemoteMs);
+      const playback = await publishWavToLiveKit(selected.roomId, audio, repeat);
+
+      // Let the last encrypted audio frames leave the sender, then disconnect only
+      // the LiveKit media transport. Keep the 1:1 MatrixRTC session alive so the
+      // phone call itself remains connected until /matrix/hangup is requested.
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      await disconnectLiveKitRoom(selected.roomId);
+
+      const active = simpleOneToOneCalls.get(selected.roomId);
+      return sendJson(res, 200, {
+        ok: true,
+        status: 'audio_played_call_still_active',
+        roomId: selected.roomId,
+        selectedBy: selected.selectedBy,
+        audio,
+        repeat,
+        remote: media.remote,
+        playback,
+        e2ee: {
+          keyIndex: media.active.ownKeyIndex ?? 0,
+          rtcBackendIdentity: media.active.ownRtcBackendIdentity || '',
+          memberId: media.active.memberId || media.livekit.memberId,
+        },
+        callStillActive: Boolean(active?.rtcSession?.isJoined?.()),
+      });
+    } catch (e) {
+      // A media failure must not tear down the already-working 1:1 signaling call.
+      if (selectedRoomId && liveKitConnections.has(selectedRoomId)) {
+        await disconnectLiveKitRoom(selectedRoomId).catch(() => {});
+      }
+      return sendJson(res, e.status || 502, {
+        ok: false,
+        error: String(e.message || e),
         details: e.body || undefined,
       });
     }
