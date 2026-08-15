@@ -1,15 +1,16 @@
 {
   "name": "matrix-call-audio-bot",
-  "version": "1.0.0",
-  "description": "Matrix call audio bot",
+  "version": "1.1.0",
+  "description": "MatrixRTC audio bot with LiveKit connectivity",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "@livekit/rtc-node": "^0.13.32",
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "ws": "^8.18.0",
-    "dotenv": "^16.4.5"
+    "ws": "^8.18.0"
   }
 }

@@ -16,8 +16,6 @@ const MATRIX_RTC_MEMBER_ID = String(process.env.MATRIX_RTC_MEMBER_ID || '').trim
 
 const jobs = new Map();
 let matrixSession = null;
-const liveKitConnections = new Map();
-let liveKitModulePromise = null;
 
 function sendJson(res, status, body) {
   const data = JSON.stringify(body);
@@ -441,81 +439,6 @@ async function requestModernLiveKitToken(focus, session, roomId, openId, options
   };
 }
 
-async function loadLiveKitRtc() {
-  if (!liveKitModulePromise) {
-    liveKitModulePromise = import('@livekit/rtc-node').catch((error) => {
-      liveKitModulePromise = null;
-      throw error;
-    });
-  }
-  return liveKitModulePromise;
-}
-
-function summarizeLiveKitRoom(roomId, connection) {
-  const room = connection?.room;
-  const local = room?.localParticipant;
-  const remoteParticipants = room
-    ? Array.from(room.remoteParticipants.values()).map((participant) => ({
-        identity: participant.identity,
-        sid: participant.sid || null,
-        name: participant.name || '',
-      }))
-    : [];
-
-  return {
-    roomId,
-    connected: Boolean(room?.isConnected),
-    livekitRoomName: room?.name || '',
-    localParticipant: local ? {
-      identity: local.identity,
-      sid: local.sid || null,
-      name: local.name || '',
-    } : null,
-    remoteParticipantCount: remoteParticipants.length,
-    remoteParticipants,
-    connectedAt: connection?.connectedAt || null,
-    memberId: connection?.memberId || null,
-    slotId: connection?.slotId || null,
-  };
-}
-
-async function disconnectLiveKitRoom(roomId) {
-  const connection = liveKitConnections.get(roomId);
-  if (!connection) return false;
-  liveKitConnections.delete(roomId);
-  try { await connection.room.disconnect(); } catch {}
-  return true;
-}
-
-async function connectLiveKitRoom(roomId, livekit) {
-  const existing = liveKitConnections.get(roomId);
-  if (existing?.room?.isConnected && existing.memberId === livekit.memberId) {
-    return summarizeLiveKitRoom(roomId, existing);
-  }
-  if (existing) await disconnectLiveKitRoom(roomId);
-
-  const { Room } = await loadLiveKitRtc();
-  const room = new Room();
-  try {
-    await room.connect(livekit.url, livekit.jwt, {
-      autoSubscribe: true,
-      dynacast: false,
-    });
-  } catch (error) {
-    try { await room.disconnect(); } catch {}
-    throw error;
-  }
-
-  const connection = {
-    room,
-    connectedAt: Date.now(),
-    memberId: livekit.memberId,
-    slotId: livekit.slotId,
-  };
-  liveKitConnections.set(roomId, connection);
-  return summarizeLiveKitRoom(roomId, connection);
-}
-
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
 
@@ -534,9 +457,6 @@ const server = http.createServer(async (req, res) => {
         matrixRooms: 'GET /matrix/rooms',
         matrixPrepare: 'POST /matrix/prepare',
         matrixToken: 'POST /matrix/token',
-        matrixConnect: 'POST /matrix/connect',
-        matrixLiveKitStatus: 'GET /matrix/livekit-status',
-        matrixDisconnect: 'POST /matrix/disconnect',
       },
     });
   }
@@ -707,86 +627,6 @@ const server = http.createServer(async (req, res) => {
         candidates: e.candidates || undefined,
         details: e.body || undefined,
       });
-    }
-  }
-
-  if (req.method === 'POST' && url.pathname === '/matrix/connect') {
-    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
-    try {
-      const body = await readJson(req);
-      const session = await ensureMatrixSession();
-      const autoJoin = await matrixAutoJoinInvites(session);
-      const selected = await discoverJoinedRoom(session, {
-        roomId: body.roomId,
-        targetUserId: body.targetUserId,
-      });
-      const membership = await matrixRoomMembership(session, selected.roomId);
-      const rtc = await discoverMatrixRtcFocus(session.userId);
-      const openId = await requestMatrixOpenId(session);
-      const livekit = await requestModernLiveKitToken(rtc.focus, session, selected.roomId, openId, {
-        slotId: body.slotId,
-        memberId: body.memberId,
-      });
-      const connection = await connectLiveKitRoom(selected.roomId, livekit);
-
-      return sendJson(res, 200, {
-        ok: true,
-        status: 'livekit_connected',
-        roomId: selected.roomId,
-        selectedBy: selected.selectedBy,
-        autoJoin,
-        matrix: {
-          userId: session.userId,
-          deviceId: session.deviceId,
-          membership: membership.membership || null,
-        },
-        rtc: {
-          authorizationService: rtc.focus.livekit_service_url,
-          mode: livekit.mode,
-          livekitUrl: livekit.url,
-          slotId: livekit.slotId,
-          memberId: livekit.memberId,
-        },
-        connection,
-        note: 'The Node realtime SDK is connected to LiveKit. No audio track has been published yet.',
-      });
-    } catch (e) {
-      return sendJson(res, e.status || 502, {
-        ok: false,
-        error: String(e.message || e),
-        candidates: e.candidates || undefined,
-        details: e.body || undefined,
-      });
-    }
-  }
-
-  if (req.method === 'GET' && url.pathname === '/matrix/livekit-status') {
-    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
-    const connections = Array.from(liveKitConnections.entries()).map(([roomId, connection]) =>
-      summarizeLiveKitRoom(roomId, connection)
-    );
-    return sendJson(res, 200, {
-      ok: true,
-      count: connections.length,
-      connections,
-    });
-  }
-
-  if (req.method === 'POST' && url.pathname === '/matrix/disconnect') {
-    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
-    try {
-      const body = await readJson(req);
-      const roomId = String(body.roomId || '').trim();
-      if (roomId) {
-        const disconnected = await disconnectLiveKitRoom(roomId);
-        return sendJson(res, 200, { ok: true, disconnected, roomId });
-      }
-
-      const roomIds = Array.from(liveKitConnections.keys());
-      for (const id of roomIds) await disconnectLiveKitRoom(id);
-      return sendJson(res, 200, { ok: true, disconnected: roomIds.length, roomIds });
-    } catch (e) {
-      return sendJson(res, 500, { ok: false, error: String(e.message || e) });
     }
   }
 
