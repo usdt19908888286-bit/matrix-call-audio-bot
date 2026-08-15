@@ -25,6 +25,7 @@ const MATRIX_RTC_SAFETY_TIMEOUT_MS = Number.isFinite(MATRIX_RTC_SAFETY_TIMEOUT_R
 
 const jobs = new Map();
 let matrixSession = null;
+let matrixLoginSuspended = false;
 const liveKitConnections = new Map();
 const liveKitDisconnectTimers = new Map();
 let liveKitModulePromise = null;
@@ -186,6 +187,11 @@ async function matrixRequest(method, pathname, body, accessToken) {
 }
 
 async function ensureMatrixSession() {
+  if (matrixLoginSuspended) {
+    const error = new Error('Matrix login is suspended. Call POST /matrix/login to resume.');
+    error.status = 409;
+    throw error;
+  }
   if (!matrixConfigured()) {
     throw new Error('Matrix is not configured. Set MATRIX_HOMESERVER, MATRIX_USER_ID and MATRIX_PASSWORD.');
   }
@@ -1039,6 +1045,54 @@ async function disconnectAllRtcRooms() {
   return { roomIds, results };
 }
 
+async function logoutMatrixSession() {
+  // First leave every RTC/LiveKit session while the Matrix access token is still valid.
+  const rtcCleanup = await disconnectAllRtcRooms();
+
+  // Stop matrix-js-sdk sync so this process is no longer an active Matrix client.
+  let clientStopped = false;
+  if (matrixRtcClientPromise) {
+    try {
+      const client = await matrixRtcClientPromise;
+      client?.stopClient?.();
+      clientStopped = true;
+    } catch (error) {
+      console.warn(`[Matrix] stopClient before logout failed: ${error?.message || error}`);
+    }
+  }
+
+  const session = matrixSession;
+  let logoutOk = false;
+  let logoutError = '';
+  if (session?.accessToken) {
+    try {
+      await matrixRequest('POST', '/_matrix/client/v3/logout', {}, session.accessToken);
+      logoutOk = true;
+      console.log(`[Matrix] logged out user=${session.userId || '?'} device=${session.deviceId || '?'}`);
+    } catch (error) {
+      logoutError = String(error?.message || error);
+      console.warn(`[Matrix] logout failed: ${logoutError}`);
+    }
+  }
+
+  matrixSession = null;
+  matrixRtcClientPromise = null;
+  matrixRtcContexts.clear();
+  matrixRtcMemberIds.clear();
+  matrixLoginSuspended = true;
+
+  return {
+    rtcCleanup,
+    clientStopped,
+    hadSession: Boolean(session?.accessToken),
+    userId: session?.userId || null,
+    deviceId: session?.deviceId || null,
+    logoutOk,
+    logoutError: logoutError || undefined,
+    loginSuspended: matrixLoginSuspended,
+  };
+}
+
 async function connectLiveKitRoom(roomId, livekit, e2eeContext) {
   const existing = liveKitConnections.get(roomId);
   if (existing?.room?.isConnected && existing.memberId === livekit.memberId && existing.e2eeKeyIndex !== undefined) {
@@ -1257,6 +1311,8 @@ const server = http.createServer(async (req, res) => {
         createJob: 'POST /play',
         jobStatus: 'GET /jobs/:id',
         matrixStatus: 'GET /matrix/status',
+        matrixLogin: 'POST /matrix/login',
+        matrixLogout: 'POST /matrix/logout',
         matrixRooms: 'GET /matrix/rooms',
         matrixPrepare: 'POST /matrix/prepare',
         matrixToken: 'POST /matrix/token',
@@ -1294,6 +1350,42 @@ const server = http.createServer(async (req, res) => {
       },
       now: new Date().toISOString(),
     });
+  }
+
+  if (req.method === 'POST' && url.pathname === '/matrix/logout') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    try {
+      const result = await logoutMatrixSession();
+      return sendJson(res, 200, {
+        ok: true,
+        status: 'matrix_logged_out',
+        ...result,
+        note: 'Docker process is still running. Matrix auto-login is suspended until POST /matrix/login is called.',
+      });
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, error: String(e.message || e) });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/matrix/login') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    try {
+      matrixLoginSuspended = false;
+      const session = await ensureMatrixSession();
+      return sendJson(res, 200, {
+        ok: true,
+        status: 'matrix_logged_in',
+        matrix: {
+          homeserver: MATRIX_HOMESERVER,
+          userId: session.userId,
+          deviceId: session.deviceId,
+          authSource: session.source,
+        },
+      });
+    } catch (e) {
+      matrixLoginSuspended = true;
+      return sendJson(res, e.status || 502, { ok: false, error: String(e.message || e) });
+    }
   }
 
   if (req.method === 'GET' && url.pathname === '/matrix/status') {
