@@ -231,6 +231,38 @@ async function matrixRoomMembership(session, roomId) {
   );
 }
 
+async function matrixPendingInvites(session) {
+  const data = await matrixRequest('GET', '/_matrix/client/v3/sync?timeout=0', undefined, session.accessToken);
+  const invite = data?.rooms?.invite;
+  return invite && typeof invite === 'object' ? Object.keys(invite) : [];
+}
+
+async function matrixJoinRoom(session, roomId) {
+  return matrixRequest(
+    'POST',
+    `/_matrix/client/v3/join/${encodeURIComponent(roomId)}`,
+    {},
+    session.accessToken,
+  );
+}
+
+async function matrixAutoJoinInvites(session) {
+  const inviteRoomIds = await matrixPendingInvites(session);
+  const joined = [];
+  const failed = [];
+
+  for (const roomId of inviteRoomIds) {
+    try {
+      const result = await matrixJoinRoom(session, roomId);
+      joined.push(result.room_id || roomId);
+    } catch (e) {
+      failed.push({ roomId, error: String(e.message || e) });
+    }
+  }
+
+  return { invited: inviteRoomIds.length, joined, failed };
+}
+
 async function matrixJoinedRooms(session) {
   const data = await matrixRequest('GET', '/_matrix/client/v3/joined_rooms', undefined, session.accessToken);
   return Array.isArray(data.joined_rooms) ? data.joined_rooms : [];
@@ -404,6 +436,7 @@ const server = http.createServer(async (req, res) => {
     if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
     try {
       const session = await ensureMatrixSession();
+      const autoJoin = await matrixAutoJoinInvites(session);
       const rtc = await discoverMatrixRtcFocus(session.userId);
       const jwtServiceHealth = await matrixRtcJwtHealth(rtc.focus);
       const joinedRooms = await matrixJoinedRooms(session);
@@ -418,6 +451,7 @@ const server = http.createServer(async (req, res) => {
           authSource: session.source,
           serverName: rtc.serverName,
           joinedRoomCount: joinedRooms.length,
+          autoJoin,
         },
         rtc: {
           focus: {
@@ -437,6 +471,7 @@ const server = http.createServer(async (req, res) => {
     if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
     try {
       const session = await ensureMatrixSession();
+      const autoJoin = await matrixAutoJoinInvites(session);
       const joinedRooms = await matrixJoinedRooms(session);
       const rooms = [];
       for (const roomId of joinedRooms) {
@@ -448,6 +483,7 @@ const server = http.createServer(async (req, res) => {
       }
       return sendJson(res, 200, {
         ok: true,
+        autoJoin,
         count: rooms.length,
         rooms,
       });
@@ -461,6 +497,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const body = await readJson(req);
       const session = await ensureMatrixSession();
+      const autoJoin = await matrixAutoJoinInvites(session);
       const selected = await discoverJoinedRoom(session, {
         roomId: body.roomId,
         targetUserId: body.targetUserId,
