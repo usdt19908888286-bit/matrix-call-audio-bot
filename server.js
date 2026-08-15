@@ -11,6 +11,8 @@ const MATRIX_USER_ID = String(process.env.MATRIX_USER_ID || '').trim();
 const MATRIX_PASSWORD = String(process.env.MATRIX_PASSWORD || '');
 const MATRIX_ACCESS_TOKEN = String(process.env.MATRIX_ACCESS_TOKEN || '').trim();
 const MATRIX_DEVICE_ID = String(process.env.MATRIX_DEVICE_ID || 'AUDIOBOT01').trim() || 'AUDIOBOT01';
+const MATRIX_RTC_SLOT_ID = String(process.env.MATRIX_RTC_SLOT_ID || 'm.call#ROOM').trim() || 'm.call#ROOM';
+const MATRIX_RTC_MEMBER_ID = String(process.env.MATRIX_RTC_MEMBER_ID || '').trim() || `${MATRIX_DEVICE_ID}-${crypto.randomUUID()}`;
 
 const jobs = new Map();
 let matrixSession = null;
@@ -399,20 +401,28 @@ async function matrixRtcJwtHealth(focus) {
   }
 }
 
-async function requestLegacyLiveKitToken(focus, session, roomId, openId) {
+async function requestModernLiveKitToken(focus, session, roomId, openId, options = {}) {
   const base = String(focus.livekit_service_url || '').replace(/\/$/, '');
   if (!base) throw new Error('missing livekit_service_url');
 
-  const response = await fetchJson(`${base}/sfu/get`, {
+  const slotId = String(options.slotId || MATRIX_RTC_SLOT_ID).trim() || MATRIX_RTC_SLOT_ID;
+  const memberId = String(options.memberId || MATRIX_RTC_MEMBER_ID).trim() || MATRIX_RTC_MEMBER_ID;
+
+  const response = await fetchJson(`${base}/get_token`, {
     method: 'POST',
     headers: {
       accept: 'application/json',
       'content-type': 'application/json',
     },
     body: JSON.stringify({
-      room: roomId,
+      room_id: roomId,
+      slot_id: slotId,
       openid_token: openId,
-      device_id: session.deviceId,
+      member: {
+        id: memberId,
+        claimed_user_id: session.userId,
+        claimed_device_id: session.deviceId,
+      },
     }),
   });
 
@@ -423,7 +433,9 @@ async function requestLegacyLiveKitToken(focus, session, roomId, openId) {
   return {
     url: response.url,
     jwt: response.jwt,
-    mode: 'legacy_sfu_get',
+    mode: 'msc4195_get_token',
+    slotId,
+    memberId,
   };
 }
 
@@ -581,7 +593,10 @@ const server = http.createServer(async (req, res) => {
       const membership = await matrixRoomMembership(session, selected.roomId);
       const rtc = await discoverMatrixRtcFocus(session.userId);
       const openId = await requestMatrixOpenId(session);
-      const livekit = await requestLegacyLiveKitToken(rtc.focus, session, selected.roomId, openId);
+      const livekit = await requestModernLiveKitToken(rtc.focus, session, selected.roomId, openId, {
+        slotId: body.slotId,
+        memberId: body.memberId,
+      });
 
       return sendJson(res, 200, {
         ok: true,
@@ -600,8 +615,10 @@ const server = http.createServer(async (req, res) => {
           livekitUrl: livekit.url,
           jwtReady: true,
           jwtLength: livekit.jwt.length,
+          slotId: livekit.slotId,
+          memberId: livekit.memberId,
         },
-        note: 'LiveKit URL and JWT were issued successfully. The next stage is connecting the Node client to LiveKit.',
+        note: 'MSC4195 /get_token succeeded with a device-aware participant identity. The next stage is connecting the Node client to LiveKit.',
       });
     } catch (e) {
       return sendJson(res, e.status || 502, {
