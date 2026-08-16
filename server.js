@@ -35,6 +35,7 @@ let matrixRtcClientPromise = null;
 const matrixRtcContexts = new Map();
 const matrixRtcMemberIds = new Map();
 const simpleOneToOneCalls = new Map();
+const armedCallJobs = new Map();
 
 function sendJson(res, status, body) {
   const data = JSON.stringify(body);
@@ -1427,6 +1428,180 @@ async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000) 
   };
 }
 
+function publicArmedCallJob(job) {
+  if (!job) return null;
+  return {
+    id: job.id,
+    roomId: job.roomId,
+    targetUserId: job.targetUserId || '',
+    audio: job.audio,
+    repeat: job.repeat,
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    deadlineAt: job.deadlineAt,
+    answeredAt: job.answeredAt || null,
+    startedPlayingAt: job.startedPlayingAt || null,
+    finishedAt: job.finishedAt || null,
+    error: job.error || undefined,
+    result: job.result || undefined,
+  };
+}
+
+function updateArmedCallJob(job, patch) {
+  Object.assign(job, patch, { updatedAt: Date.now() });
+  return job;
+}
+
+function isArmedCallJobCurrent(job) {
+  return Boolean(job && armedCallJobs.get(job.roomId) === job && !job.cancelled);
+}
+
+async function waitForArmedCallAnswer(job, session) {
+  const client = await ensureMatrixRtcClient(session);
+  let room = client.getRoom(job.roomId);
+  if (!room) {
+    await client.joinRoom(job.roomId);
+    room = client.getRoom(job.roomId);
+  }
+  if (!room) throw new Error(`Matrix room is not available in matrix-js-sdk: ${job.roomId}`);
+
+  const rtcSession = client.matrixRTC.getRoomSession(room);
+  await rtcSession.initialMembershipCalculated;
+  console.log(`[call-arm] waiting for answer room=${job.roomId} target=${job.targetUserId || '*'} timeout=${job.waitForAnswerMs}ms`);
+
+  while (Date.now() < job.deadlineAt) {
+    if (!isArmedCallJobCurrent(job)) {
+      const error = new Error('call-arm cancelled');
+      error.code = 'CALL_ARM_CANCELLED';
+      throw error;
+    }
+
+    if (typeof rtcSession._onRTCSessionMemberUpdate === 'function') {
+      try { await rtcSession._onRTCSessionMemberUpdate(); } catch {}
+    }
+
+    const memberships = Array.isArray(rtcSession.memberships) ? rtcSession.memberships : [];
+    const external = memberships.filter((membership) => !(
+      membership?.userId === session.userId && membership?.deviceId === session.deviceId
+    ));
+    const recentCutoff = job.createdAt - 10000;
+    const isRecentMembership = (membership) => {
+      try {
+        const ts = typeof membership?.createdTs === 'function' ? Number(membership.createdTs()) : 0;
+        return !ts || ts >= recentCutoff;
+      } catch {
+        return true;
+      }
+    };
+    const hasTarget = job.targetUserId
+      ? external.some((membership) => membership?.userId === job.targetUserId && isRecentMembership(membership))
+      : external.some((membership) => membership?.userId !== session.userId && isRecentMembership(membership));
+    const hasCallerSide = external.some((membership) => (
+      !job.targetUserId || membership?.userId !== job.targetUserId || membership?.userId === session.userId
+    ));
+
+    // During ringing we normally see only the Work/caller membership. Once B
+    // answers there are at least two memberships external to this VPS device.
+    if (external.length >= 2 && hasTarget && hasCallerSide) {
+      const summary = external.map(summarizeRtcMembership);
+      console.log(`[call-arm] answered room=${job.roomId} members=${summary.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
+      return { rtcSession, memberships: summary };
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  const error = new Error(`call-arm timed out waiting for answer after ${job.waitForAnswerMs}ms`);
+  error.code = 'CALL_ARM_TIMEOUT';
+  throw error;
+}
+
+async function cleanupArmedCallMedia(job, session) {
+  if (liveKitConnections.has(job.roomId)) {
+    await disconnectLiveKitRoom(job.roomId).catch((error) => {
+      console.warn(`[call-arm] LiveKit cleanup failed room=${job.roomId}: ${error?.message || error}`);
+    });
+  }
+  const active = simpleOneToOneCalls.get(job.roomId);
+  if (active?.source === 'attached_existing') {
+    return await detachFromExistingOneToOneCall(session, job.roomId, active).catch((error) => {
+      console.warn(`[call-arm] attach cleanup failed room=${job.roomId}: ${error?.message || error}`);
+      return null;
+    });
+  }
+  return null;
+}
+
+async function runArmedCallJob(job) {
+  let session = null;
+  let media = null;
+  try {
+    session = await ensureMatrixSession();
+    const answered = await waitForArmedCallAnswer(job, session);
+    if (!isArmedCallJobCurrent(job)) {
+      const error = new Error('call-arm cancelled');
+      error.code = 'CALL_ARM_CANCELLED';
+      throw error;
+    }
+
+    updateArmedCallJob(job, {
+      status: 'answered',
+      answeredAt: Date.now(),
+      answeredMemberships: answered.memberships,
+    });
+
+    // Reuse the exact external-call attach path that has already been verified
+    // to produce audible encrypted media without sending another ring.
+    updateArmedCallJob(job, { status: 'attaching' });
+    media = await connectSimpleCallMedia(session, job.roomId, job.waitForRemoteMs);
+
+    if (!isArmedCallJobCurrent(job)) {
+      const error = new Error('call-arm cancelled before playback');
+      error.code = 'CALL_ARM_CANCELLED';
+      throw error;
+    }
+
+    updateArmedCallJob(job, { status: 'playing', startedPlayingAt: Date.now() });
+    console.log(`[call-arm] playing room=${job.roomId} audio=${job.audio} repeat=${job.repeat} source=${media.callSource}`);
+    const playback = await publishWavToLiveKit(job.roomId, job.audio, job.repeat);
+
+    if (!isArmedCallJobCurrent(job)) {
+      const error = new Error('call-arm cancelled during playback');
+      error.code = 'CALL_ARM_CANCELLED';
+      throw error;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    const detach = await cleanupArmedCallMedia(job, session);
+    const result = {
+      callSource: media.callSource,
+      remote: media.remote,
+      playback,
+      vpsDetach: detach || undefined,
+      originalCallStillActive: detach ? Boolean(detach.originalCallStillActive) : undefined,
+    };
+
+    updateArmedCallJob(job, {
+      status: 'finished',
+      finishedAt: Date.now(),
+      result,
+    });
+    console.log(`[call-arm] finished room=${job.roomId} originalActive=${result.originalCallStillActive}`);
+  } catch (error) {
+    if (session) await cleanupArmedCallMedia(job, session);
+
+    const cancelled = error?.code === 'CALL_ARM_CANCELLED' || job.cancelled;
+    const timedOut = error?.code === 'CALL_ARM_TIMEOUT';
+    updateArmedCallJob(job, {
+      status: cancelled ? 'cancelled' : timedOut ? 'timeout' : 'failed',
+      finishedAt: Date.now(),
+      error: String(error?.message || error),
+    });
+    console.log(`[call-arm] ${job.status} room=${job.roomId} error=${job.error}`);
+  }
+}
+
 function summarizeMatrixRtcContext(roomId, context) {
   return {
     roomId,
@@ -2233,6 +2408,151 @@ const server = http.createServer(async (req, res) => {
         details: e.body || undefined,
       });
     }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/matrix/call-arm') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    try {
+      const body = await readJson(req);
+      const session = await ensureMatrixSession();
+      const selected = await discoverJoinedRoom(session, {
+        roomId: body.roomId,
+        targetUserId: body.targetUserId,
+      });
+
+      const audio = normalizeAudioName(body.audio || 'test');
+      const repeat = Math.max(1, Math.min(10, Number(body.repeat || 1)));
+      const targetUserId = String(body.targetUserId || '').trim();
+      const requestedWaitForAnswerMs = Number(body.waitForAnswerMs);
+      const waitForAnswerMs = Number.isFinite(requestedWaitForAnswerMs)
+        ? Math.max(5000, Math.min(180000, Math.round(requestedWaitForAnswerMs)))
+        : 60000;
+      const requestedWaitForRemoteMs = Number(body.waitForRemoteMs);
+      const waitForRemoteMs = Number.isFinite(requestedWaitForRemoteMs)
+        ? Math.max(1000, Math.min(30000, Math.round(requestedWaitForRemoteMs)))
+        : 15000;
+
+      if (!audio) return sendJson(res, 400, { ok: false, error: 'invalid audio name' });
+      if (audio !== 'test') {
+        const file = audioFilePath(audio);
+        try {
+          if (!fs.statSync(file).isFile()) throw new Error('not a file');
+        } catch {
+          return sendJson(res, 404, { ok: false, error: `audio not found: ${audio}.wav` });
+        }
+      }
+
+      const existing = armedCallJobs.get(selected.roomId);
+      const terminalStatuses = new Set(['finished', 'failed', 'timeout', 'cancelled']);
+      if (existing && !terminalStatuses.has(existing.status)) {
+        return sendJson(res, 409, {
+          ok: false,
+          error: 'call-arm already active for this room',
+          job: publicArmedCallJob(existing),
+        });
+      }
+
+      const activeSimple = simpleOneToOneCalls.get(selected.roomId);
+      if (activeSimple?.rtcSession?.isJoined?.()) {
+        return sendJson(res, 409, {
+          ok: false,
+          error: 'VPS already has an active MatrixRTC membership in this room',
+          source: activeSimple.source || 'vps_started',
+        });
+      }
+
+      const now = Date.now();
+      const job = {
+        id: crypto.randomUUID(),
+        roomId: selected.roomId,
+        targetUserId,
+        audio,
+        repeat,
+        waitForAnswerMs,
+        waitForRemoteMs,
+        status: 'waiting_answer',
+        cancelled: false,
+        createdAt: now,
+        updatedAt: now,
+        deadlineAt: now + waitForAnswerMs,
+        answeredAt: null,
+        startedPlayingAt: null,
+        finishedAt: null,
+        error: '',
+        result: null,
+      };
+      armedCallJobs.set(selected.roomId, job);
+      console.log(`[call-arm] armed room=${selected.roomId} target=${targetUserId || '*'} audio=${audio} repeat=${repeat}`);
+      void runArmedCallJob(job);
+
+      return sendJson(res, 202, {
+        ok: true,
+        status: 'waiting_answer',
+        selectedBy: selected.selectedBy,
+        job: publicArmedCallJob(job),
+      });
+    } catch (e) {
+      return sendJson(res, e.status || 502, {
+        ok: false,
+        error: String(e.message || e),
+        candidates: e.candidates || undefined,
+        details: e.body || undefined,
+      });
+    }
+  }
+
+  if (req.method === 'POST' && url.pathname === '/matrix/call-cancel') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    try {
+      const body = await readJson(req);
+      const session = await ensureMatrixSession();
+      const selected = await discoverJoinedRoom(session, {
+        roomId: body.roomId,
+        targetUserId: body.targetUserId,
+      });
+      const job = armedCallJobs.get(selected.roomId);
+      if (!job) {
+        return sendJson(res, 404, { ok: false, error: 'no call-arm job for this room' });
+      }
+
+      const terminalStatuses = new Set(['finished', 'failed', 'timeout', 'cancelled']);
+      if (terminalStatuses.has(job.status)) {
+        return sendJson(res, 200, {
+          ok: true,
+          status: 'already_finished',
+          job: publicArmedCallJob(job),
+        });
+      }
+
+      job.cancelled = true;
+      updateArmedCallJob(job, {
+        status: 'cancelled',
+        finishedAt: Date.now(),
+        error: String(body.reason || 'cancelled by Work'),
+      });
+      console.log(`[call-arm] cancel requested room=${selected.roomId} reason=${job.error}`);
+
+      return sendJson(res, 200, {
+        ok: true,
+        status: 'cancelled',
+        job: publicArmedCallJob(job),
+      });
+    } catch (e) {
+      return sendJson(res, e.status || 502, {
+        ok: false,
+        error: String(e.message || e),
+        details: e.body || undefined,
+      });
+    }
+  }
+
+  if (req.method === 'GET' && url.pathname === '/matrix/call-arm-status') {
+    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+    const roomId = String(url.searchParams.get('roomId') || '').trim();
+    if (!roomId) return sendJson(res, 400, { ok: false, error: 'roomId is required' });
+    const job = armedCallJobs.get(roomId);
+    if (!job) return sendJson(res, 404, { ok: false, error: 'no call-arm job for this room' });
+    return sendJson(res, 200, { ok: true, job: publicArmedCallJob(job) });
   }
 
   if (req.method === 'POST' && url.pathname === '/matrix/call-play') {
