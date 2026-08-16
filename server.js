@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.5';
+const BOT_VERSION = '2026.08.16.6';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
@@ -2074,6 +2074,17 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1, wavBufferOverr
 
   try {
     publication = await connection.room.localParticipant.publishTrack(track, options);
+    const e2eeContext = matrixRtcContexts.get(roomId) || simpleOneToOneCalls.get(roomId);
+    if (e2eeContext?.ownKey) {
+      // A FrameCryptor is created only after the track is published. Apply the
+      // participant key immediately so no startup frames leave before E2EE is ready.
+      applyLiveKitOutboundKey(
+        roomId,
+        e2eeContext.ownKey,
+        e2eeContext.ownKeyIndex ?? 0,
+        e2eeContext.ownRtcBackendIdentity,
+      );
+    }
     if (typeof publication?.waitForSubscription === 'function') {
       console.log(`[LiveKit] waiting for remote subscription track=${publication?.sid || track.sid || '?'} room=${roomId}`);
       await Promise.race([
@@ -2082,14 +2093,16 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1, wavBufferOverr
       ]);
       console.log(`[LiveKit] remote subscribed track=${publication?.sid || track.sid || '?'} room=${roomId}`);
     }
-    const e2eeContext = matrixRtcContexts.get(roomId) || simpleOneToOneCalls.get(roomId);
     if (e2eeContext?.ownKey) {
+      // Re-apply after subscription as a safety net in case the cryptor was
+      // recreated while the receiver subscribed.
       applyLiveKitOutboundKey(
         roomId,
         e2eeContext.ownKey,
         e2eeContext.ownKeyIndex ?? 0,
         e2eeContext.ownRtcBackendIdentity,
       );
+      await new Promise((resolve) => setTimeout(resolve, 150));
     }
     for (let loop = 0; loop < loops; loop++) {
       for (let start = 0; start < wav.samples.length; start += frameSampleCount) {
