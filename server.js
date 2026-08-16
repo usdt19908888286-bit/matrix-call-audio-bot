@@ -4,14 +4,14 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.3';
+const BOT_VERSION = '2026.08.16.4';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
 const AZURE_SPEECH_REGION = String(process.env.AZURE_SPEECH_REGION || '').trim().toLowerCase();
 const AZURE_TTS_VOICE = String(process.env.AZURE_TTS_VOICE || 'zh-CN-XiaoxiaoNeural').trim() || 'zh-CN-XiaoxiaoNeural';
 const AZURE_TTS_LOCALE = String(process.env.AZURE_TTS_LOCALE || 'zh-CN').trim() || 'zh-CN';
-const AZURE_TTS_OUTPUT_FORMAT = 'riff-24khz-16bit-mono-pcm';
+const AZURE_TTS_OUTPUT_FORMAT = 'riff-16khz-16bit-mono-pcm';
 const MATRIX_HOMESERVER = String(process.env.MATRIX_HOMESERVER || '').replace(/\/$/, '');
 const MATRIX_USER_ID = String(process.env.MATRIX_USER_ID || '').trim();
 const MATRIX_PASSWORD = String(process.env.MATRIX_PASSWORD || '');
