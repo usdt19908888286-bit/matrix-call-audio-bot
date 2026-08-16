@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.10';
+const BOT_VERSION = '2026.08.16.11';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
@@ -1224,10 +1224,11 @@ async function stopSimpleOneToOneCall(session, roomId) {
   return { left, cleared };
 }
 
-async function startSimpleOneToOneCall(session, roomId) {
-  // Mirror the already-working local caller exactly at the signaling layer:
-  // getRoomSession() -> joinRoomSession() -> SDK-generated ring.
-  // No LiveKit media connection and no sticky-membership mode are used here.
+async function startSimpleOneToOneCall(session, roomId, options = {}) {
+  // Normal mode mirrors the browser caller and lets matrix-js-sdk send the ring.
+  // deferNotification mode is used by Work-linked Bot calls: first join and make
+  // this exact caller device LiveKit-ready, then send the ring notification.
+  const deferNotification = Boolean(options.deferNotification);
   if (simpleOneToOneCalls.has(roomId)) {
     await stopSimpleOneToOneCall(session, roomId);
   }
@@ -1295,26 +1296,69 @@ async function startSimpleOneToOneCall(session, roomId) {
     for (const waiter of Array.from(simpleContext.keyWaiters)) waiter.reject(wrapped);
   });
 
-  const notificationPromise = new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('MatrixRTC ring notification was not sent within 20000ms')), 20000);
-    rtcSession.once('did_send_call_notification', (notification) => {
-      clearTimeout(timer);
-      resolve(notification);
+  let notificationPromise = null;
+  if (!deferNotification) {
+    notificationPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('MatrixRTC ring notification was not sent within 20000ms')), 20000);
+      rtcSession.once('did_send_call_notification', (notification) => {
+        clearTimeout(timer);
+        resolve(notification);
+      });
+      rtcSession.once('membership_manager_error', (error) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      });
     });
-    rtcSession.once('membership_manager_error', (error) => {
-      clearTimeout(timer);
-      reject(error instanceof Error ? error : new Error(String(error)));
-    });
-  });
+  }
 
   rtcSession.joinRoomSession([], focus, {
-    notificationType: 'ring',
+    ...(deferNotification ? {} : { notificationType: 'ring' }),
     callIntent: 'audio',
     manageMediaKeys: true,
   });
   simpleOneToOneCalls.set(roomId, simpleContext);
 
   try {
+    if (deferNotification) {
+      const ownDeadline = Date.now() + 10000;
+      let ownMembership = null;
+      while (Date.now() < ownDeadline) {
+        if (typeof rtcSession._onRTCSessionMemberUpdate === 'function') {
+          try { await rtcSession._onRTCSessionMemberUpdate(); } catch {}
+        }
+        try { rtcSession.reemitEncryptionKeys?.(); } catch {}
+        ownMembership = (rtcSession.memberships || []).find((membership) => (
+          membership?.userId === session.userId && membership?.deviceId === session.deviceId
+        )) || null;
+        if (ownMembership?.eventId && simpleContext.ownKey) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (!ownMembership?.eventId) throw new Error('Bot caller MatrixRTC membership event is not visible yet');
+      await waitForOwnMatrixRtcKey(simpleContext, 15000);
+
+      const preparedMedia = await prepareOriginatedCallMedia(session, roomId);
+      console.log(`[originated] media ready before ring room=${roomId} identity=${simpleContext.ownRtcBackendIdentity || '?'}`);
+
+      const notificationContent = {
+        'm.mentions': { user_ids: [], room: true },
+        notification_type: 'ring',
+        'm.relates_to': { event_id: ownMembership.eventId, rel_type: 'm.reference' },
+        sender_ts: Date.now(),
+        lifetime: 60000,
+        'm.call.intent': 'audio',
+      };
+      const notification = await client.sendEvent(roomId, 'org.matrix.msc4075.rtc.notification', notificationContent);
+      return {
+        roomId,
+        opponentUserId: opponents[0].userId,
+        notificationEventId: notification?.event_id || null,
+        notificationType: 'ring',
+        state: 'ringing',
+        focus,
+        preparedMedia,
+      };
+    }
+
     const notification = await notificationPromise;
     return {
       roomId,
@@ -1640,6 +1684,39 @@ async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000, 
   };
 }
 
+async function prepareOriginatedCallMedia(session, roomId) {
+  const startedAt = Date.now();
+  const active = simpleOneToOneCalls.get(roomId);
+  if (!active?.rtcSession?.isJoined?.()) {
+    const error = new Error('Bot-originated MatrixRTC call is not joined');
+    error.status = 409;
+    throw error;
+  }
+
+  if (!active.ownKey && typeof active.rtcSession._onRTCSessionMemberUpdate === 'function') {
+    try { await active.rtcSession._onRTCSessionMemberUpdate(); } catch {}
+  }
+  try { active.rtcSession.reemitEncryptionKeys?.(); } catch {}
+  await waitForOwnMatrixRtcKey(active, 15000);
+
+  const memberId = active.memberId || await resolveSimpleCallMemberId(session, roomId, active);
+  const [rtc, openId] = await Promise.all([
+    discoverMatrixRtcTransport(session),
+    requestMatrixOpenId(session),
+  ]);
+  const livekit = await requestLegacyLiveKitToken(rtc.transport, session, roomId, openId, { memberId });
+  const connection = await connectLiveKitRoom(roomId, livekit, active);
+  console.log(`[originated] caller media connected room=${roomId} ms=${Date.now() - startedAt}`);
+  return {
+    active,
+    livekit,
+    connection,
+    remote: null,
+    callSource: 'vps_started',
+    existingCall: null,
+  };
+}
+
 function publicArmedCallJob(job) {
   if (!job) return null;
   return {
@@ -1651,6 +1728,8 @@ function publicArmedCallJob(job) {
     tts: job.ttsText ? { provider: 'microsoft', voice: job.ttsVoice || AZURE_TTS_VOICE, chars: job.ttsText.length } : undefined,
     repeat: job.repeat,
     status: job.status,
+    originatedByBot: Boolean(job.originatedByBot),
+    ringStartedAt: job.ringStartedAt || null,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
     deadlineAt: job.deadlineAt,
@@ -1715,9 +1794,13 @@ async function waitForArmedCallAnswer(job, session) {
       !job.targetUserId || membership?.userId !== job.targetUserId || membership?.userId === session.userId
     ));
 
-    // During ringing we normally see only the Work/caller membership. Once B
-    // answers there are at least two memberships external to this VPS device.
-    if (external.length >= 2 && hasTarget && hasCallerSide) {
+    // Work-originated calls have a separate Work caller membership plus B, while
+    // Bot-originated calls use this VPS device as the real caller and therefore
+    // only need the target membership to appear after answer.
+    const answeredNow = job.originatedByBot
+      ? (external.length >= 1 && hasTarget)
+      : (external.length >= 2 && hasTarget && hasCallerSide);
+    if (answeredNow) {
       const summary = external.map(summarizeRtcMembership);
       console.log(`[call-arm] answered room=${job.roomId} members=${summary.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
       return { rtcSession, memberships: summary };
@@ -1738,6 +1821,12 @@ async function cleanupArmedCallMedia(job, session) {
     });
   }
   const active = simpleOneToOneCalls.get(job.roomId);
+  if (job.originatedByBot && active?.source === 'vps_started') {
+    return await stopSimpleOneToOneCall(session, job.roomId).catch((error) => {
+      console.warn(`[call-arm] originated-call cleanup failed room=${job.roomId}: ${error?.message || error}`);
+      return null;
+    });
+  }
   if (active?.source === 'attached_existing') {
     return await detachFromExistingOneToOneCall(session, job.roomId, active).catch((error) => {
       console.warn(`[call-arm] attach cleanup failed room=${job.roomId}: ${error?.message || error}`);
@@ -1763,21 +1852,10 @@ async function runArmedCallJob(job) {
       );
     }
 
-    // Work sends the ring itself. While the phone is ringing, join silently as a
-    // second device of the same sender and establish LiveKit/E2EE, but DO NOT
-    // publish audio yet. This keeps a real SFU participant present so iOS does
-    // not accept into an empty media room and immediately tear the call down.
-    const preconnectStartedAt = Date.now();
-    mediaTask = connectSimpleCallMedia(
-      session,
-      job.roomId,
-      Math.max(job.waitForRemoteMs, job.waitForAnswerMs),
-      { allowBeforeAnswer: true, notBeforeMs: job.createdAt - 1000 },
-    ).then(
-      (value) => ({ ok: true, value, ms: Date.now() - preconnectStartedAt }),
-      (error) => ({ ok: false, error, ms: Date.now() - preconnectStartedAt }),
-    );
-    console.log(`[preconnect] silent media anchor starting room=${job.roomId}`);
+    if (job.originatedByBot && job.preconnectedMedia) {
+      mediaTask = Promise.resolve({ ok: true, value: job.preconnectedMedia, ms: 0 });
+      console.log(`[originated] caller media was ready before ring room=${job.roomId}`);
+    }
 
     const answered = await waitForArmedCallAnswer(job, session);
     if (!isArmedCallJobCurrent(job)) {
@@ -1794,10 +1872,16 @@ async function runArmedCallJob(job) {
     console.log(`[latency] answered room=${job.roomId} at=${job.answeredAt}`);
 
     updateArmedCallJob(job, { status: 'attaching' });
-    const preparedMedia = mediaTask ? await mediaTask : null;
-    if (!preparedMedia?.ok) throw preparedMedia?.error || new Error('Pre-answer media anchor failed');
-    media = preparedMedia.value;
-    console.log(`[preconnect] silent media anchor ready room=${job.roomId} total=${preparedMedia.ms}ms`);
+    if (job.originatedByBot) {
+      const preparedMedia = mediaTask ? await mediaTask : null;
+      if (!preparedMedia?.ok) throw preparedMedia?.error || new Error('Bot-originated caller media was not prepared');
+      media = preparedMedia.value;
+      const remoteStartedAt = Date.now();
+      media.remote = await waitForLiveKitRemoteParticipant(job.roomId, job.waitForRemoteMs);
+      console.log(`[latency] remote-participant-after-answer room=${job.roomId} ms=${Date.now() - remoteStartedAt}`);
+    } else {
+      media = await connectSimpleCallMedia(session, job.roomId, job.waitForRemoteMs);
+    }
     console.log(`[latency] answer-to-media-ready room=${job.roomId} ms=${Date.now() - job.answeredAt}`);
 
     if (!isArmedCallJobCurrent(job)) {
@@ -2736,6 +2820,7 @@ const server = http.createServer(async (req, res) => {
       const targetUserId = String(body.targetUserId || '').trim();
       const ttsText = String(body.ttsText || '').trim();
       const ttsVoice = String(body.ttsVoice || AZURE_TTS_VOICE).trim() || AZURE_TTS_VOICE;
+      const originateRing = body.originateRing === true;
       const requestedWaitForAnswerMs = Number(body.waitForAnswerMs);
       const waitForAnswerMs = Number.isFinite(requestedWaitForAnswerMs)
         ? Math.max(5000, Math.min(180000, Math.round(requestedWaitForAnswerMs)))
@@ -2793,7 +2878,11 @@ const server = http.createServer(async (req, res) => {
         repeat,
         waitForAnswerMs,
         waitForRemoteMs,
-        status: 'waiting_answer',
+        originatedByBot: originateRing,
+        ringCall: null,
+        ringStartedAt: null,
+        preconnectedMedia: null,
+        status: originateRing ? 'starting_ring' : 'waiting_answer',
         cancelled: false,
         createdAt: now,
         updatedAt: now,
@@ -2805,14 +2894,31 @@ const server = http.createServer(async (req, res) => {
         result: null,
       };
       armedCallJobs.set(selected.roomId, job);
-      console.log(`[call-arm] armed room=${selected.roomId} sender=${session.userId} target=${targetUserId || '*'} media=${ttsText ? `tts:${ttsVoice}` : `audio:${audio}`} repeat=${repeat} source=${workLinked ? 'work' : 'legacy'}`);
+      console.log(`[call-arm] armed room=${selected.roomId} sender=${session.userId} target=${targetUserId || '*'} media=${ttsText ? `tts:${ttsVoice}` : `audio:${audio}`} repeat=${repeat} source=${workLinked ? 'work' : 'legacy'} originateRing=${originateRing}`);
+
+      if (originateRing) {
+        try {
+          const started = await startSimpleOneToOneCall(session, selected.roomId, { deferNotification: true });
+          job.preconnectedMedia = started.preparedMedia || null;
+          const { preparedMedia, ...ringCall } = started;
+          job.ringCall = ringCall;
+          updateArmedCallJob(job, { status: 'ringing', ringStartedAt: Date.now() });
+          console.log(`[originated] ring sent after media ready room=${selected.roomId} device=${session.deviceId} target=${targetUserId || '*'}`);
+        } catch (error) {
+          armedCallJobs.delete(selected.roomId);
+          throw error;
+        }
+      }
+
       void runArmedCallJob(job);
 
       return sendJson(res, 202, {
         ok: true,
-        status: 'waiting_answer',
+        status: job.status,
+        ringHandled: originateRing,
         selectedBy: selected.selectedBy,
         linkedBy: workLinked ? 'work_sender_credentials' : 'legacy_server_account',
+        call: job.ringCall || undefined,
         job: publicArmedCallJob(job),
       });
     } catch (e) {
