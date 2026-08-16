@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.9';
+const BOT_VERSION = '2026.08.16.10';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
@@ -1376,7 +1376,47 @@ async function waitForExistingAnsweredRtcCall(rtcSession, session, timeoutMs = 1
   }
 }
 
-async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs = 15000) {
+async function waitForExistingCallerRtcCall(rtcSession, session, timeoutMs = 15000, notBeforeMs = 0) {
+  const startedAt = Date.now();
+  const waitMs = Math.max(1000, Math.min(120000, Math.round(Number(timeoutMs) || 15000)));
+  const cutoff = Math.max(0, Number(notBeforeMs) || 0);
+
+  while (true) {
+    if (typeof rtcSession._onRTCSessionMemberUpdate === 'function') {
+      try { await rtcSession._onRTCSessionMemberUpdate(); } catch {}
+    }
+
+    const memberships = Array.isArray(rtcSession.memberships) ? rtcSession.memberships : [];
+    const callerMemberships = memberships.filter((membership) => {
+      if (!(membership?.userId === session.userId && membership?.deviceId !== session.deviceId)) return false;
+      if (!cutoff) return true;
+      try {
+        const createdTs = typeof membership?.createdTs === 'function' ? Number(membership.createdTs()) : 0;
+        return !createdTs || createdTs >= cutoff;
+      } catch {
+        return true;
+      }
+    });
+    if (callerMemberships.length) {
+      const summary = callerMemberships.map(summarizeRtcMembership);
+      console.log(`[preconnect] caller membership found room=${rtcSession.room?.roomId || '?'} members=${summary.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
+      return {
+        waitedMs: Date.now() - startedAt,
+        memberships: summary,
+        preAnswer: true,
+      };
+    }
+
+    if (Date.now() - startedAt >= waitMs) {
+      const error = new Error(`No Work caller MatrixRTC membership found within ${waitMs}ms`);
+      error.status = 409;
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 75));
+  }
+}
+
+async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs = 15000, options = {}) {
   const client = await ensureMatrixRtcClient(session);
   const { rtc: rtcModule } = await loadMatrixRtcSdk();
   let room = client.getRoom(roomId);
@@ -1400,7 +1440,9 @@ async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs =
     throw error;
   }
 
-  const existingCall = await waitForExistingAnsweredRtcCall(rtcSession, session, waitForAnsweredMs);
+  const existingCall = options.allowBeforeAnswer
+    ? await waitForExistingCallerRtcCall(rtcSession, session, waitForAnsweredMs, options.notBeforeMs)
+    : await waitForExistingAnsweredRtcCall(rtcSession, session, waitForAnsweredMs);
   const discovered = await discoverMatrixRtcTransport(session);
   const existingFocus = rtcSession.getFocusInUse?.();
   const focus = existingFocus?.type === 'livekit' && existingFocus?.livekit_service_url
@@ -1419,6 +1461,7 @@ async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs =
     keysSeen: 0,
     startedAt: Date.now(),
     source: 'attached_existing',
+    preAnswer: Boolean(existingCall.preAnswer),
     existingCall,
     encryptionListener: null,
     membershipErrorListener: null,
@@ -1448,9 +1491,9 @@ async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs =
   rtcSession.on(rtcModule.MatrixRTCSessionEvent.MembershipManagerError, attachContext.membershipErrorListener);
 
   try {
-    console.log(`[attach] existing answered call found room=${roomId} members=${existingCall.memberships.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
-    // Deliberately omit notificationType: the software already rang and B has
-    // answered. The VPS joins only as a media sender and must not ring again.
+    console.log(`[attach] existing ${existingCall.preAnswer ? 'ringing' : 'answered'} call found room=${roomId} members=${existingCall.memberships.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
+    // Deliberately omit notificationType: Work owns the ring notification. The
+    // VPS may pre-connect as a silent media anchor, but it must never ring again.
     rtcSession.joinRoomSession([], focus, {
       callIntent: 'audio',
       manageMediaKeys: true,
@@ -1462,7 +1505,7 @@ async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs =
     }
     try { rtcSession.reemitEncryptionKeys?.(); } catch {}
     await waitForOwnMatrixRtcKey(attachContext, 15000);
-    console.log(`[attach] VPS media membership joined room=${roomId} identity=${attachContext.ownRtcBackendIdentity || '?'}`);
+    console.log(`[attach] VPS media ${attachContext.preAnswer ? 'anchor' : 'membership'} joined room=${roomId} identity=${attachContext.ownRtcBackendIdentity || '?'} preAnswer=${attachContext.preAnswer}`);
     return { context: attachContext, existingCall, focus };
   } catch (error) {
     simpleOneToOneCalls.delete(roomId);
@@ -1539,7 +1582,7 @@ async function resolveSimpleCallMemberId(session, roomId, active) {
   throw error;
 }
 
-async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000) {
+async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000, options = {}) {
   const totalStartedAt = Date.now();
   let active = simpleOneToOneCalls.get(roomId);
   let attached = null;
@@ -1549,7 +1592,7 @@ async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000) 
   // sending another ring notification.
   if (!active?.rtcSession?.isJoined?.()) {
     const startedAt = Date.now();
-    attached = await attachToExistingOneToOneCall(session, roomId, waitForRemoteMs);
+    attached = await attachToExistingOneToOneCall(session, roomId, waitForRemoteMs, options);
     active = attached.context;
     console.log(`[latency] attach-existing room=${roomId} ms=${Date.now() - startedAt}`);
   }
@@ -1707,6 +1750,7 @@ async function cleanupArmedCallMedia(job, session) {
 async function runArmedCallJob(job) {
   let session = null;
   let media = null;
+  let mediaTask = null;
   let ttsTask = null;
   try {
     session = job.matrixSession || await ensureMatrixSession();
@@ -1718,6 +1762,23 @@ async function runArmedCallJob(job) {
         (error) => ({ ok: false, error, synthesizeMs: Date.now() - ttsStartedAt }),
       );
     }
+
+    // Work sends the ring itself. While the phone is ringing, join silently as a
+    // second device of the same sender and establish LiveKit/E2EE, but DO NOT
+    // publish audio yet. This keeps a real SFU participant present so iOS does
+    // not accept into an empty media room and immediately tear the call down.
+    const preconnectStartedAt = Date.now();
+    mediaTask = connectSimpleCallMedia(
+      session,
+      job.roomId,
+      Math.max(job.waitForRemoteMs, job.waitForAnswerMs),
+      { allowBeforeAnswer: true, notBeforeMs: job.createdAt - 1000 },
+    ).then(
+      (value) => ({ ok: true, value, ms: Date.now() - preconnectStartedAt }),
+      (error) => ({ ok: false, error, ms: Date.now() - preconnectStartedAt }),
+    );
+    console.log(`[preconnect] silent media anchor starting room=${job.roomId}`);
+
     const answered = await waitForArmedCallAnswer(job, session);
     if (!isArmedCallJobCurrent(job)) {
       const error = new Error('call-arm cancelled');
@@ -1732,10 +1793,11 @@ async function runArmedCallJob(job) {
     });
     console.log(`[latency] answered room=${job.roomId} at=${job.answeredAt}`);
 
-    // Reuse the exact external-call attach path that has already been verified
-    // to produce audible encrypted media without sending another ring.
     updateArmedCallJob(job, { status: 'attaching' });
-    media = await connectSimpleCallMedia(session, job.roomId, job.waitForRemoteMs);
+    const preparedMedia = mediaTask ? await mediaTask : null;
+    if (!preparedMedia?.ok) throw preparedMedia?.error || new Error('Pre-answer media anchor failed');
+    media = preparedMedia.value;
+    console.log(`[preconnect] silent media anchor ready room=${job.roomId} total=${preparedMedia.ms}ms`);
     console.log(`[latency] answer-to-media-ready room=${job.roomId} ms=${Date.now() - job.answeredAt}`);
 
     if (!isArmedCallJobCurrent(job)) {
