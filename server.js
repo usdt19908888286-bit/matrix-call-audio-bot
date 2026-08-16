@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.6.1';
+const BOT_VERSION = '2026.08.16.6.2';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
@@ -12,6 +12,13 @@ const AZURE_SPEECH_REGION = String(process.env.AZURE_SPEECH_REGION || '').trim()
 const AZURE_TTS_VOICE = String(process.env.AZURE_TTS_VOICE || 'zh-CN-XiaoxiaoNeural').trim() || 'zh-CN-XiaoxiaoNeural';
 const AZURE_TTS_LOCALE = String(process.env.AZURE_TTS_LOCALE || 'zh-CN').trim() || 'zh-CN';
 const AZURE_TTS_OUTPUT_FORMAT = 'riff-16khz-16bit-mono-pcm';
+const LIVEKIT_API_URL = String(process.env.LIVEKIT_API_URL || process.env.LIVEKIT_URL || '').trim().replace(/\/$/, '');
+const LIVEKIT_API_KEY = String(process.env.LIVEKIT_API_KEY || '').trim();
+const LIVEKIT_API_SECRET = String(process.env.LIVEKIT_API_SECRET || '').trim();
+const LIVEKIT_ACTIVE_STABLE_RAW = Number(process.env.LIVEKIT_ACTIVE_STABLE_MS || 250);
+const LIVEKIT_ACTIVE_STABLE_MS = Number.isFinite(LIVEKIT_ACTIVE_STABLE_RAW)
+  ? Math.max(100, Math.min(3000, Math.round(LIVEKIT_ACTIVE_STABLE_RAW)))
+  : 250;
 const MATRIX_HOMESERVER = String(process.env.MATRIX_HOMESERVER || '').replace(/\/$/, '');
 const MATRIX_USER_ID = String(process.env.MATRIX_USER_ID || '').trim();
 const MATRIX_PASSWORD = String(process.env.MATRIX_PASSWORD || '');
@@ -35,6 +42,9 @@ let matrixLoginSuspended = false;
 const liveKitConnections = new Map();
 const liveKitDisconnectTimers = new Map();
 let liveKitModulePromise = null;
+let liveKitServerModulePromise = null;
+let liveKitRoomServiceClient = null;
+const liveKitRoomNameCache = new Map();
 let matrixJsSdkPromise = null;
 let matrixRtcModulePromise = null;
 let matrixRtcClientPromise = null;
@@ -843,6 +853,103 @@ async function loadLiveKitRtc() {
   return liveKitModulePromise;
 }
 
+function liveKitReadyGateConfigured() {
+  return Boolean(LIVEKIT_API_URL && LIVEKIT_API_KEY && LIVEKIT_API_SECRET);
+}
+
+function normalizeLiveKitApiUrl(value) {
+  const raw = String(value || '').trim().replace(/\/$/, '');
+  if (raw.startsWith('wss://')) return `https://${raw.slice(6)}`;
+  if (raw.startsWith('ws://')) return `http://${raw.slice(5)}`;
+  return raw;
+}
+
+async function loadLiveKitServerSdk() {
+  if (!liveKitServerModulePromise) {
+    liveKitServerModulePromise = import('livekit-server-sdk').catch((error) => {
+      liveKitServerModulePromise = null;
+      throw error;
+    });
+  }
+  return liveKitServerModulePromise;
+}
+
+async function getLiveKitRoomServiceClient() {
+  if (!liveKitReadyGateConfigured()) return null;
+  if (liveKitRoomServiceClient) return liveKitRoomServiceClient;
+  const { RoomServiceClient } = await loadLiveKitServerSdk();
+  liveKitRoomServiceClient = new RoomServiceClient(
+    normalizeLiveKitApiUrl(LIVEKIT_API_URL),
+    LIVEKIT_API_KEY,
+    LIVEKIT_API_SECRET,
+  );
+  return liveKitRoomServiceClient;
+}
+
+function isLiveKitParticipantActive(participant) {
+  const state = participant?.state;
+  return Number(state) === 2 || String(state || '').toUpperCase() === 'ACTIVE';
+}
+
+async function lookupLiveKitParticipant(matrixRoomId, rtcBackendIdentity) {
+  const identity = String(rtcBackendIdentity || '').trim();
+  if (!identity) return { found: false, active: false, reason: 'missing_rtc_backend_identity' };
+
+  const service = await getLiveKitRoomServiceClient();
+  if (!service) return { found: false, active: false, reason: 'room_service_not_configured' };
+
+  const cachedRoomName = liveKitRoomNameCache.get(matrixRoomId) || '';
+  if (cachedRoomName) {
+    try {
+      const participant = await service.getParticipant(cachedRoomName, identity);
+      return {
+        found: true,
+        active: isLiveKitParticipantActive(participant),
+        roomName: cachedRoomName,
+        participant,
+      };
+    } catch {
+      liveKitRoomNameCache.delete(matrixRoomId);
+    }
+  }
+
+  // Fast path for installations where the Matrix room alias is also the
+  // physical LiveKit room name.
+  try {
+    const participant = await service.getParticipant(matrixRoomId, identity);
+    liveKitRoomNameCache.set(matrixRoomId, matrixRoomId);
+    return {
+      found: true,
+      active: isLiveKitParticipantActive(participant),
+      roomName: matrixRoomId,
+      participant,
+    };
+  } catch {}
+
+  // MatrixRTC JWT focus may map the Matrix room to a generated LiveKit room
+  // name. Discover that room without joining it: list active rooms, then find
+  // the exact rtcBackendIdentity. Once found, cache the mapping for this call.
+  const rooms = await service.listRooms();
+  for (const room of rooms || []) {
+    const roomName = String(room?.name || '').trim();
+    if (!roomName) continue;
+    try {
+      const participants = await service.listParticipants(roomName);
+      const participant = (participants || []).find((item) => String(item?.identity || '') === identity);
+      if (!participant) continue;
+      liveKitRoomNameCache.set(matrixRoomId, roomName);
+      return {
+        found: true,
+        active: isLiveKitParticipantActive(participant),
+        roomName,
+        participant,
+      };
+    } catch {}
+  }
+
+  return { found: false, active: false, reason: 'participant_not_found' };
+}
+
 async function loadMatrixRtcSdk() {
   if (!matrixJsSdkPromise) {
     matrixJsSdkPromise = import('matrix-js-sdk').catch((error) => {
@@ -1644,11 +1751,21 @@ async function waitForArmedCallAnswer(job, session) {
       .map(membershipKey),
   );
 
-  console.log(`[call-arm] waiting for answer room=${job.roomId} target=${job.targetUserId || '*'} timeout=${job.waitForAnswerMs}ms baselineTarget=${baselineTargetKeys.size}`);
+  const useLiveKitReadyGate = liveKitReadyGateConfigured();
+  liveKitRoomNameCache.delete(job.roomId);
+  console.log(`[call-arm] waiting for answer room=${job.roomId} target=${job.targetUserId || '*'} timeout=${job.waitForAnswerMs}ms baselineTarget=${baselineTargetKeys.size} gate=${useLiveKitReadyGate ? 'livekit-active' : 'membership-600ms'}`);
+  if (!useLiveKitReadyGate) {
+    console.warn('[livekit-ready] RoomService credentials are not configured; keeping the v6.1 membership-stable fallback');
+  }
 
   let stableTargetKey = '';
   let stableTargetSince = 0;
   let candidateLogged = false;
+  let activeParticipantKey = '';
+  let activeParticipantSince = 0;
+  let liveKitReadyLogged = false;
+  let lastLiveKitErrorLogAt = 0;
+  let missingIdentityLogged = false;
 
   while (Date.now() < job.deadlineAt) {
     if (!isArmedCallJobCurrent(job)) {
@@ -1683,28 +1800,83 @@ async function waitForArmedCallAnswer(job, session) {
         stableTargetKey = key;
         stableTargetSince = Date.now();
         candidateLogged = false;
+        activeParticipantKey = '';
+        activeParticipantSince = 0;
+        liveKitReadyLogged = false;
+        missingIdentityLogged = false;
       }
 
       const heldMs = Date.now() - stableTargetSince;
       if (!candidateLogged) {
-        console.log(`[call-arm] answer candidate room=${job.roomId} target=${freshTarget.userId || '?'} device=${freshTarget.deviceId || '?'} waiting_stable=600ms`);
+        console.log(`[call-arm] answer candidate room=${job.roomId} target=${freshTarget.userId || '?'} device=${freshTarget.deviceId || '?'} rtcIdentity=${freshTarget.rtcBackendIdentity || '?'} gate=${useLiveKitReadyGate ? 'livekit-active' : 'membership-600ms'}`);
         candidateLogged = true;
       }
 
-      // Do not let the VPS Bot join on a one-poll/transient membership. The
-      // target must be a NEW membership for this call and remain present first.
-      if (heldMs >= 600) {
-        const summary = external.map(summarizeRtcMembership);
-        console.log(`[call-arm] answered room=${job.roomId} targetStable=${heldMs}ms members=${summary.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
-        return { rtcSession, memberships: summary };
+      if (!useLiveKitReadyGate) {
+        // Exact v6.1 fallback: only use this when RoomService credentials have
+        // not been configured on the VPS.
+        if (heldMs >= 600) {
+          const summary = external.map(summarizeRtcMembership);
+          console.log(`[call-arm] answered room=${job.roomId} targetStable=${heldMs}ms gate=membership-fallback members=${summary.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
+          return { rtcSession, memberships: summary };
+        }
+      } else {
+        const rtcIdentity = String(freshTarget.rtcBackendIdentity || '').trim();
+        if (!rtcIdentity) {
+          activeParticipantKey = '';
+          activeParticipantSince = 0;
+          liveKitReadyLogged = false;
+          if (!missingIdentityLogged) {
+            console.log(`[livekit-ready] waiting for target rtcBackendIdentity room=${job.roomId} device=${freshTarget.deviceId || '?'}`);
+            missingIdentityLogged = true;
+          }
+        } else {
+          try {
+            const readiness = await lookupLiveKitParticipant(job.roomId, rtcIdentity);
+            if (readiness.found && readiness.active) {
+              const readyKey = `${readiness.roomName || ''}|${rtcIdentity}`;
+              if (readyKey !== activeParticipantKey) {
+                activeParticipantKey = readyKey;
+                activeParticipantSince = Date.now();
+                liveKitReadyLogged = false;
+              }
+              const activeMs = Date.now() - activeParticipantSince;
+              if (!liveKitReadyLogged) {
+                console.log(`[livekit-ready] target ACTIVE room=${job.roomId} livekitRoom=${readiness.roomName || '?'} identity=${rtcIdentity} waiting_stable=${LIVEKIT_ACTIVE_STABLE_MS}ms`);
+                liveKitReadyLogged = true;
+              }
+              if (activeMs >= LIVEKIT_ACTIVE_STABLE_MS) {
+                const summary = external.map(summarizeRtcMembership);
+                console.log(`[call-arm] answered room=${job.roomId} livekitActive=${activeMs}ms targetMembership=${heldMs}ms members=${summary.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
+                return { rtcSession, memberships: summary };
+              }
+            } else {
+              activeParticipantKey = '';
+              activeParticipantSince = 0;
+              liveKitReadyLogged = false;
+            }
+          } catch (error) {
+            activeParticipantKey = '';
+            activeParticipantSince = 0;
+            liveKitReadyLogged = false;
+            if (Date.now() - lastLiveKitErrorLogAt >= 3000) {
+              console.warn(`[livekit-ready] RoomService check failed room=${job.roomId}: ${error?.message || error}`);
+              lastLiveKitErrorLogAt = Date.now();
+            }
+          }
+        }
       }
     } else {
       stableTargetKey = '';
       stableTargetSince = 0;
       candidateLogged = false;
+      activeParticipantKey = '';
+      activeParticipantSince = 0;
+      liveKitReadyLogged = false;
+      missingIdentityLogged = false;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await new Promise((resolve) => setTimeout(resolve, useLiveKitReadyGate ? 100 : 150));
   }
 
   const error = new Error(`call-arm timed out waiting for answer after ${job.waitForAnswerMs}ms`);
@@ -2237,6 +2409,12 @@ const server = http.createServer(async (req, res) => {
         outputFormat: AZURE_TTS_OUTPUT_FORMAT,
       },
       dynamicSenderSessionCount: dynamicMatrixSessions.size,
+      liveKitAnswerGate: {
+        configured: liveKitReadyGateConfigured(),
+        apiUrl: LIVEKIT_API_URL ? normalizeLiveKitApiUrl(LIVEKIT_API_URL) : '',
+        activeStableMs: LIVEKIT_ACTIVE_STABLE_MS,
+        fallback: liveKitReadyGateConfigured() ? 'none' : 'membership-stable-600ms',
+      },
       rtcClean: activeRtcRoomIds.length === 0,
       activeRtcRoomCount: activeRtcRoomIds.length,
       activeRtcRoomIds,
