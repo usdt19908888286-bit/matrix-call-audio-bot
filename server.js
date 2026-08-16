@@ -1,10 +1,10 @@
-const http = require('http');
+﻿const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.4';
+const BOT_VERSION = '2026.08.16.5';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
@@ -2094,10 +2094,10 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1, wavBufferOverr
     for (let loop = 0; loop < loops; loop++) {
       for (let start = 0; start < wav.samples.length; start += frameSampleCount) {
         const end = Math.min(start + frameSampleCount, wav.samples.length);
-        const frameData = wav.samples.subarray(start, end);
+        const frameData = wav.samples.slice(start, end);
         const actualSamplesPerChannel = Math.floor(frameData.length / wav.channels);
         if (actualSamplesPerChannel <= 0) continue;
-        const aligned = frameData.subarray(0, actualSamplesPerChannel * wav.channels);
+        const aligned = frameData.slice(0, actualSamplesPerChannel * wav.channels);
         await source.captureFrame(new AudioFrame(aligned, wav.sampleRate, wav.channels, actualSamplesPerChannel));
       }
     }
