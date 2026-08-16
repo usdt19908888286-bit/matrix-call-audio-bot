@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.7';
+const BOT_VERSION = '2026.08.16.8';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
@@ -12,10 +12,6 @@ const AZURE_SPEECH_REGION = String(process.env.AZURE_SPEECH_REGION || '').trim()
 const AZURE_TTS_VOICE = String(process.env.AZURE_TTS_VOICE || 'zh-CN-XiaoxiaoNeural').trim() || 'zh-CN-XiaoxiaoNeural';
 const AZURE_TTS_LOCALE = String(process.env.AZURE_TTS_LOCALE || 'zh-CN').trim() || 'zh-CN';
 const AZURE_TTS_OUTPUT_FORMAT = 'riff-16khz-16bit-mono-pcm';
-const REMOTE_MEDIA_READY_TIMEOUT_RAW = Number(process.env.REMOTE_MEDIA_READY_TIMEOUT_MS || 2500);
-const REMOTE_MEDIA_READY_TIMEOUT_MS = Number.isFinite(REMOTE_MEDIA_READY_TIMEOUT_RAW)
-  ? Math.max(0, Math.min(10000, Math.round(REMOTE_MEDIA_READY_TIMEOUT_RAW)))
-  : 2500;
 const MATRIX_HOMESERVER = String(process.env.MATRIX_HOMESERVER || '').replace(/\/$/, '');
 const MATRIX_USER_ID = String(process.env.MATRIX_USER_ID || '').trim();
 const MATRIX_PASSWORD = String(process.env.MATRIX_PASSWORD || '');
@@ -1207,101 +1203,6 @@ async function waitForLiveKitRemoteParticipant(roomId, timeoutMs = 45000) {
   }
 }
 
-function liveKitParticipantPublications(participant) {
-  if (!participant) return [];
-  try {
-    if (typeof participant.getTrackPublications === 'function') {
-      const publications = participant.getTrackPublications();
-      if (Array.isArray(publications)) return publications;
-      if (publications && typeof publications.values === 'function') return Array.from(publications.values());
-      if (publications && Symbol.iterator in Object(publications)) return Array.from(publications);
-    }
-  } catch {}
-  const candidates = [participant.trackPublications, participant.audioTrackPublications];
-  for (const collection of candidates) {
-    if (!collection) continue;
-    try {
-      if (typeof collection.values === 'function') return Array.from(collection.values());
-      if (Array.isArray(collection)) return collection;
-      if (Symbol.iterator in Object(collection)) return Array.from(collection);
-    } catch {}
-  }
-  return [];
-}
-
-function liveKitParticipantMatchesUser(participant, targetUserId) {
-  const identity = String(participant?.identity || '');
-  const target = String(targetUserId || '').trim();
-  if (!target) return true;
-  return identity === target || identity.startsWith(`${target}:`);
-}
-
-async function inspectRemoteMediaReady(roomId, targetUserId = '') {
-  const connection = liveKitConnections.get(roomId);
-  const room = connection?.room;
-  if (!room?.isConnected) {
-    return { ready: false, reason: 'livekit_not_connected' };
-  }
-
-  const { TrackKind } = await loadLiveKitRtc();
-  const participants = Array.from(room.remoteParticipants.values())
-    .filter((participant) => liveKitParticipantMatchesUser(participant, targetUserId));
-
-  for (const participant of participants) {
-    const publications = liveKitParticipantPublications(participant);
-    for (const publication of publications) {
-      const kind = publication?.kind ?? publication?.track?.kind;
-      if (kind !== TrackKind?.KIND_AUDIO) continue;
-      // Requiring the subscribed track object is stronger than merely seeing a
-      // LiveKit participant. On iOS this arrives only after the call media path
-      // has come up, which is a much better playback gate for lock-screen answers.
-      if (!publication?.track) continue;
-      return {
-        ready: true,
-        participantIdentity: participant.identity || '',
-        participantSid: participant.sid || null,
-        trackSid: publication.sid || publication.trackSid || publication?.track?.sid || null,
-        trackName: publication.name || publication?.track?.name || '',
-        trackSource: publication.source ?? publication?.track?.source ?? null,
-        muted: Boolean(publication.muted ?? publication.isMuted ?? publication?.track?.muted ?? false),
-      };
-    }
-  }
-
-  return {
-    ready: false,
-    reason: participants.length ? 'target_audio_track_not_ready' : 'target_participant_not_ready',
-    participantCount: participants.length,
-  };
-}
-
-async function waitForRemoteMediaReady(roomId, targetUserId = '', timeoutMs = REMOTE_MEDIA_READY_TIMEOUT_MS) {
-  const startedAt = Date.now();
-  const waitMs = Math.max(0, Math.min(10000, Math.round(Number(timeoutMs) || 0)));
-  let last = { ready: false, reason: 'not_checked' };
-
-  while (true) {
-    last = await inspectRemoteMediaReady(roomId, targetUserId);
-    if (last.ready) {
-      const result = { ...last, waitedMs: Date.now() - startedAt, fallback: false };
-      console.log(`[media-ready] ready room=${roomId} target=${targetUserId || '*'} participant=${result.participantIdentity || '?'} track=${result.trackSid || '?'} waited=${result.waitedMs}ms`);
-      return result;
-    }
-
-    const elapsed = Date.now() - startedAt;
-    if (elapsed >= waitMs) {
-      // Some clients may join with the microphone disabled and therefore never
-      // publish an audio track. Preserve compatibility by falling back instead
-      // of failing the whole call, but surface the fallback in job diagnostics.
-      const result = { ...last, ready: false, waitedMs: elapsed, fallback: true };
-      console.warn(`[media-ready] fallback room=${roomId} target=${targetUserId || '*'} reason=${last.reason || 'timeout'} waited=${elapsed}ms`);
-      return result;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-}
-
 async function stopSimpleOneToOneCall(session, roomId) {
   const active = simpleOneToOneCalls.get(roomId);
   if (liveKitConnections.has(roomId)) {
@@ -1500,12 +1401,18 @@ async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs =
   }
 
   const answeredMemberships = Array.isArray(options.answeredMemberships) ? options.answeredMemberships : [];
-  const existingCall = answeredMemberships.length >= 2
+  const existingCall = answeredMemberships.length
     ? { waitedMs: 0, memberships: answeredMemberships, reusedAnswerDetection: true }
     : await waitForExistingAnsweredRtcCall(rtcSession, session, waitForAnsweredMs);
-  const preparedTransport = options.rtcTransport?.livekit_service_url ? options.rtcTransport : null;
-  const discovered = preparedTransport ? null : await discoverMatrixRtcTransport(session);
   const existingFocus = rtcSession.getFocusInUse?.();
+  let preparedTransport = options.rtcTransport?.livekit_service_url ? options.rtcTransport : null;
+  if (!existingFocus?.livekit_service_url && !preparedTransport && options.rtcPrepPromise) {
+    const prepared = await options.rtcPrepPromise;
+    if (prepared?.ok && prepared.transport?.livekit_service_url) preparedTransport = prepared.transport;
+  }
+  const discovered = (!existingFocus?.livekit_service_url && !preparedTransport)
+    ? await discoverMatrixRtcTransport(session)
+    : null;
   const focus = existingFocus?.type === 'livekit' && existingFocus?.livekit_service_url
     ? { ...existingFocus, livekit_alias: existingFocus.livekit_alias || roomId }
     : { ...(preparedTransport || discovered.transport), livekit_alias: roomId };
@@ -1643,18 +1550,17 @@ async function resolveSimpleCallMemberId(session, roomId, active) {
 }
 
 async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000, options = {}) {
+  const startedAt = Date.now();
   let active = simpleOneToOneCalls.get(roomId);
   let attached = null;
 
-  // Preserve the known-good VPS-originated path. If the VPS did not originate
-  // this call, look for an already-answered MatrixRTC call and attach without
-  // sending another ring notification.
+  // Preserve the known-good media path. For Work-triggered calls the answered
+  // condition has already been proven, so reuse that result instead of polling it again.
   if (!active?.rtcSession?.isJoined?.()) {
-    attached = await attachToExistingOneToOneCall(session, roomId, waitForRemoteMs, {
-      answeredMemberships: options.answeredMemberships,
-      rtcTransport: options.rtcTransport,
-    });
+    const attachStartedAt = Date.now();
+    attached = await attachToExistingOneToOneCall(session, roomId, waitForRemoteMs, options);
     active = attached.context;
+    console.log(`[latency] attach+e2ee room=${roomId} ms=${Date.now() - attachStartedAt}`);
   }
 
   const memberId = await resolveSimpleCallMemberId(session, roomId, active);
@@ -1665,20 +1571,50 @@ async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000, 
   try { active.rtcSession.reemitEncryptionKeys?.(); } catch {}
   await waitForOwnMatrixRtcKey(active, 15000);
 
-  const rtcTransport = options.rtcTransport?.livekit_service_url
-    ? options.rtcTransport
-    : (await discoverMatrixRtcTransport(session)).transport;
-  const openId = options.openId?.access_token ? options.openId : await requestMatrixOpenId(session);
+  const transportStartedAt = Date.now();
+  let prepared = options.rtcPrepared || null;
+  if (!prepared && options.rtcPrepPromise) prepared = await options.rtcPrepPromise;
+  if (prepared?.ok && prepared.openId?.access_token && Date.now() - prepared.preparedAt > 30000) {
+    try {
+      prepared = {
+        ...prepared,
+        openId: await requestMatrixOpenId(session),
+        preparedAt: Date.now(),
+        refreshedOpenId: true,
+      };
+    } catch (error) {
+      console.warn(`[call-arm] preflight OpenID refresh failed room=${roomId}: ${error?.message || error}`);
+      prepared = { ok: false, error };
+    }
+  }
+  const rtcTransport = prepared?.ok && prepared.transport?.livekit_service_url
+    ? prepared.transport
+    : options.rtcTransport?.livekit_service_url
+      ? options.rtcTransport
+      : (await discoverMatrixRtcTransport(session)).transport;
+  const openId = prepared?.ok && prepared.openId?.access_token
+    ? prepared.openId
+    : options.openId?.access_token
+      ? options.openId
+      : await requestMatrixOpenId(session);
+  console.log(`[latency] rtc-auth-ready room=${roomId} ms=${Date.now() - transportStartedAt} prewarmed=${Boolean(prepared?.ok)} prepareMs=${prepared?.prepareMs ?? -1}`);
+
+  const tokenStartedAt = Date.now();
   const livekit = await requestLegacyLiveKitToken(rtcTransport, session, roomId, openId, {
     memberId,
   });
+  console.log(`[latency] livekit-token room=${roomId} ms=${Date.now() - tokenStartedAt}`);
+
+  const connectStartedAt = Date.now();
   const connection = await connectLiveKitRoom(roomId, livekit, active);
   const remote = await waitForLiveKitRemoteParticipant(roomId, waitForRemoteMs);
+  console.log(`[latency] livekit-connect+remote room=${roomId} ms=${Date.now() - connectStartedAt}`);
   return {
     active,
     livekit,
     connection,
     remote,
+    mediaConnectMs: Date.now() - startedAt,
     callSource: active.source || 'vps_started',
     existingCall: attached?.existingCall || active.existingCall || null,
   };
@@ -1699,8 +1635,6 @@ function publicArmedCallJob(job) {
     updatedAt: job.updatedAt,
     deadlineAt: job.deadlineAt,
     answeredAt: job.answeredAt || null,
-    mediaReadyAt: job.mediaReadyAt || null,
-    mediaReady: job.mediaReady || undefined,
     startedPlayingAt: job.startedPlayingAt || null,
     finishedAt: job.finishedAt || null,
     error: job.error || undefined,
@@ -1809,16 +1743,16 @@ async function runArmedCallJob(job) {
       );
     }
 
-    // These requests do not join MatrixRTC and therefore do not affect ringing.
-    // Warm them while the phone is ringing so the post-answer critical path only
-    // has to attach, obtain the per-device E2EE key, mint the LiveKit token and connect.
+    // Warm only requests that do not join MatrixRTC, so ringing behavior stays unchanged.
+    // OpenID is refreshed after a long ring to avoid using a stale preflight token.
     const rtcPrepStartedAt = Date.now();
     rtcPrepTask = Promise.all([
       discoverMatrixRtcTransport(session),
       requestMatrixOpenId(session),
+      loadLiveKitRtc(),
     ]).then(
-      ([rtc, openId]) => ({ ok: true, transport: rtc.transport, openId, prepareMs: Date.now() - rtcPrepStartedAt }),
-      (error) => ({ ok: false, error, prepareMs: Date.now() - rtcPrepStartedAt }),
+      ([rtc, openId]) => ({ ok: true, transport: rtc.transport, openId, preparedAt: Date.now(), prepareMs: Date.now() - rtcPrepStartedAt }),
+      (error) => ({ ok: false, error, preparedAt: Date.now(), prepareMs: Date.now() - rtcPrepStartedAt }),
     );
 
     const answered = await waitForArmedCallAnswer(job, session);
@@ -1834,21 +1768,16 @@ async function runArmedCallJob(job) {
       answeredMemberships: answered.memberships,
     });
 
-    const rtcPrepared = rtcPrepTask ? await rtcPrepTask : null;
-    if (rtcPrepared?.ok) {
-      console.log(`[call-arm] RTC preflight ready room=${job.roomId} prepare=${rtcPrepared.prepareMs}ms`);
-    } else if (rtcPrepared?.error) {
-      console.warn(`[call-arm] RTC preflight failed; falling back to post-answer requests room=${job.roomId} error=${rtcPrepared.error?.message || rtcPrepared.error}`);
-    }
-
-    // Reuse the verified external-call attach path, but do not wait for the
-    // answered condition a second time: waitForArmedCallAnswer already proved it.
+    // Reuse the verified media path, but skip only the duplicate answered poll.
+    // Keep preflight running in parallel with attach/E2EE instead of blocking on it.
+    // No iOS/media-ready gate is inserted here: the proven publish/subscription path remains intact.
     updateArmedCallJob(job, { status: 'attaching' });
+    const mediaStartedAt = Date.now();
     media = await connectSimpleCallMedia(session, job.roomId, job.waitForRemoteMs, {
       answeredMemberships: answered.memberships,
-      rtcTransport: rtcPrepared?.ok ? rtcPrepared.transport : null,
-      openId: rtcPrepared?.ok ? rtcPrepared.openId : null,
+      rtcPrepPromise: rtcPrepTask,
     });
+    console.log(`[latency] answer-to-livekit-ready room=${job.roomId} ms=${Date.now() - mediaStartedAt}`);
 
     if (!isArmedCallJobCurrent(job)) {
       const error = new Error('call-arm cancelled before playback');
@@ -1856,28 +1785,8 @@ async function runArmedCallJob(job) {
       throw error;
     }
 
-    // A LiveKit participant alone is not enough on iOS lock-screen answers: the
-    // CallKit answer can be visible before AVAudioSession/media has actually come up.
-    // Gate playback on the target participant's subscribed audio track when possible.
-    updateArmedCallJob(job, { status: 'waiting_media_ready' });
-    const mediaReady = await waitForRemoteMediaReady(
-      job.roomId,
-      job.targetUserId,
-      job.mediaReadyTimeoutMs ?? REMOTE_MEDIA_READY_TIMEOUT_MS,
-    );
-    updateArmedCallJob(job, {
-      status: 'media_ready',
-      mediaReadyAt: Date.now(),
-      mediaReady,
-    });
-
-    if (!isArmedCallJobCurrent(job)) {
-      const error = new Error('call-arm cancelled while waiting for media ready');
-      error.code = 'CALL_ARM_CANCELLED';
-      throw error;
-    }
-
     updateArmedCallJob(job, { status: 'playing', startedPlayingAt: Date.now() });
+    console.log(`[latency] answer-to-publish-start room=${job.roomId} ms=${Date.now() - (job.answeredAt || Date.now())}`);
     let playback;
     let tts = null;
     if (job.ttsText) {
@@ -1908,7 +1817,6 @@ async function runArmedCallJob(job) {
     const result = {
       callSource: media.callSource,
       remote: media.remote,
-      mediaReady,
       playback,
       tts: tts || undefined,
       vpsDetach: detach || undefined,
@@ -2230,7 +2138,9 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1, wavBufferOverr
   let publication = null;
 
   try {
+    const publishStartedAt = Date.now();
     publication = await connection.room.localParticipant.publishTrack(track, options);
+    console.log(`[latency] publish-track room=${roomId} ms=${Date.now() - publishStartedAt}`);
     const e2eeContext = matrixRtcContexts.get(roomId) || simpleOneToOneCalls.get(roomId);
     if (e2eeContext?.ownKey) {
       // A FrameCryptor is created only after the track is published. Apply the
@@ -2243,12 +2153,14 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1, wavBufferOverr
       );
     }
     if (typeof publication?.waitForSubscription === 'function') {
+      const subscriptionStartedAt = Date.now();
       console.log(`[LiveKit] waiting for remote subscription track=${publication?.sid || track.sid || '?'} room=${roomId}`);
       await Promise.race([
         publication.waitForSubscription(),
         new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out waiting for remote audio-track subscription')), 10000)),
       ]);
       console.log(`[LiveKit] remote subscribed track=${publication?.sid || track.sid || '?'} room=${roomId}`);
+      console.log(`[latency] remote-subscription room=${roomId} ms=${Date.now() - subscriptionStartedAt}`);
     }
     if (e2eeContext?.ownKey) {
       // Re-apply after subscription as a safety net in case the cryptor was
@@ -2261,6 +2173,7 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1, wavBufferOverr
       );
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
+    let firstFrameSentAt = 0;
     for (let loop = 0; loop < loops; loop++) {
       for (let start = 0; start < wav.samples.length; start += frameSampleCount) {
         const end = Math.min(start + frameSampleCount, wav.samples.length);
@@ -2269,6 +2182,10 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1, wavBufferOverr
         if (actualSamplesPerChannel <= 0) continue;
         const aligned = frameData.slice(0, actualSamplesPerChannel * wav.channels);
         await source.captureFrame(new AudioFrame(aligned, wav.sampleRate, wav.channels, actualSamplesPerChannel));
+        if (!firstFrameSentAt) {
+          firstFrameSentAt = Date.now();
+          console.log(`[latency] first-pcm-frame room=${roomId} track=${publication?.sid || track.sid || '?'} at=${firstFrameSentAt}`);
+        }
       }
     }
     await source.waitForPlayout();
@@ -2347,11 +2264,6 @@ const server = http.createServer(async (req, res) => {
         voice: AZURE_TTS_VOICE,
         locale: AZURE_TTS_LOCALE,
         outputFormat: AZURE_TTS_OUTPUT_FORMAT,
-      },
-      remoteMediaReady: {
-        enabled: true,
-        mode: 'target_livekit_audio_track',
-        timeoutMs: REMOTE_MEDIA_READY_TIMEOUT_MS,
       },
       dynamicSenderSessionCount: dynamicMatrixSessions.size,
       rtcClean: activeRtcRoomIds.length === 0,
@@ -2811,10 +2723,6 @@ const server = http.createServer(async (req, res) => {
       const waitForRemoteMs = Number.isFinite(requestedWaitForRemoteMs)
         ? Math.max(1000, Math.min(30000, Math.round(requestedWaitForRemoteMs)))
         : 15000;
-      const requestedMediaReadyTimeoutMs = Number(body.mediaReadyTimeoutMs);
-      const mediaReadyTimeoutMs = Number.isFinite(requestedMediaReadyTimeoutMs)
-        ? Math.max(0, Math.min(10000, Math.round(requestedMediaReadyTimeoutMs)))
-        : REMOTE_MEDIA_READY_TIMEOUT_MS;
 
       if (ttsText.length > 5000) return sendJson(res, 400, { ok: false, error: 'ttsText is too long (max 5000 chars)' });
       if (ttsText && !azureTtsConfigured()) {
@@ -2864,15 +2772,12 @@ const server = http.createServer(async (req, res) => {
         repeat,
         waitForAnswerMs,
         waitForRemoteMs,
-        mediaReadyTimeoutMs,
         status: 'waiting_answer',
         cancelled: false,
         createdAt: now,
         updatedAt: now,
         deadlineAt: now + waitForAnswerMs,
         answeredAt: null,
-        mediaReadyAt: null,
-        mediaReady: null,
         startedPlayingAt: null,
         finishedAt: null,
         error: '',
