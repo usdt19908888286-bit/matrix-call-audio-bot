@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
+const BOT_VERSION = '2026.08.16.2';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const MATRIX_HOMESERVER = String(process.env.MATRIX_HOMESERVER || '').replace(/\/$/, '');
@@ -32,6 +33,9 @@ let liveKitModulePromise = null;
 let matrixJsSdkPromise = null;
 let matrixRtcModulePromise = null;
 let matrixRtcClientPromise = null;
+const matrixRtcClientPromises = new Map();
+const dynamicMatrixSessions = new Map();
+const dynamicMatrixDeviceIds = new Map();
 const matrixRtcContexts = new Map();
 const matrixRtcMemberIds = new Map();
 const simpleOneToOneCalls = new Map();
@@ -229,6 +233,76 @@ async function ensureMatrixSession() {
     loggedInAt: Date.now(),
   };
   return matrixSession;
+}
+
+function dynamicMatrixDeviceId(userId) {
+  const key = String(userId || '').trim();
+  let deviceId = dynamicMatrixDeviceIds.get(key);
+  if (!deviceId) {
+    const suffix = crypto.randomBytes(4).toString('hex').toUpperCase();
+    deviceId = `${MATRIX_DEVICE_ID_PREFIX}-WORK-${suffix}`;
+    dynamicMatrixDeviceIds.set(key, deviceId);
+  }
+  return deviceId;
+}
+
+async function ensureMatrixSessionForCredentials(userId, password) {
+  const normalizedUserId = String(userId || '').trim();
+  const normalizedPassword = String(password || '');
+  if (!normalizedUserId.startsWith('@') || !normalizedUserId.includes(':')) {
+    const error = new Error('senderUserId must be a valid Matrix user ID');
+    error.status = 400;
+    throw error;
+  }
+  if (!normalizedPassword) {
+    const error = new Error('senderPassword is required');
+    error.status = 400;
+    throw error;
+  }
+  if (!MATRIX_HOMESERVER) {
+    const error = new Error('MATRIX_HOMESERVER is not configured');
+    error.status = 500;
+    throw error;
+  }
+
+  const passwordHash = crypto.createHash('sha256').update(normalizedPassword).digest('hex');
+  const cached = dynamicMatrixSessions.get(normalizedUserId);
+  if (cached?.accessToken && cached.passwordHash === passwordHash) {
+    try {
+      const who = await matrixRequest('GET', '/_matrix/client/v3/account/whoami', undefined, cached.accessToken);
+      if (who.user_id === normalizedUserId) {
+        cached.deviceId = who.device_id || cached.deviceId;
+        return cached;
+      }
+    } catch {}
+    dynamicMatrixSessions.delete(normalizedUserId);
+  }
+
+  if (cached && cached.passwordHash !== passwordHash) {
+    dynamicMatrixSessions.delete(normalizedUserId);
+  }
+
+  const deviceId = dynamicMatrixDeviceId(normalizedUserId);
+  const login = await matrixRequest('POST', '/_matrix/client/v3/login', {
+    type: 'm.login.password',
+    identifier: { type: 'm.id.user', user: normalizedUserId },
+    password: normalizedPassword,
+    device_id: deviceId,
+    initial_device_display_name: 'Matrix Audio Bot (Work linked)',
+  });
+  if (!login.access_token) throw new Error('Matrix sender login succeeded without access_token');
+
+  const session = {
+    accessToken: login.access_token,
+    userId: login.user_id || normalizedUserId,
+    deviceId: login.device_id || deviceId,
+    source: 'work_credentials',
+    loggedInAt: Date.now(),
+    passwordHash,
+  };
+  dynamicMatrixSessions.set(normalizedUserId, session);
+  console.log(`[Matrix] Work-linked sender login user=${session.userId} device=${session.deviceId}`);
+  return session;
 }
 
 function matrixServerName(userId) {
@@ -748,13 +822,16 @@ async function waitForMatrixPrepared(client, sdk, timeoutMs = 20000) {
 }
 
 async function ensureMatrixRtcClient(session) {
-  if (session.source !== 'password_login') {
-    const error = new Error('Latest MatrixRTC E2EE mode requires password login so this process can own a fresh Matrix device for the in-memory Rust crypto store');
+  if (session.source !== 'password_login' && session.source !== 'work_credentials') {
+    const error = new Error('Latest MatrixRTC E2EE mode requires a password-login Matrix device for the in-memory Rust crypto store');
     error.status = 409;
     throw error;
   }
-  if (!matrixRtcClientPromise) {
-    matrixRtcClientPromise = (async () => {
+
+  const clientKey = `${session.userId}|${session.deviceId}`;
+  let clientPromise = matrixRtcClientPromises.get(clientKey);
+  if (!clientPromise) {
+    clientPromise = (async () => {
       const { sdk } = await loadMatrixRtcSdk();
       const client = sdk.createClient({
         baseUrl: MATRIX_HOMESERVER,
@@ -763,18 +840,23 @@ async function ensureMatrixRtcClient(session) {
         deviceId: session.deviceId,
       });
 
-      console.log('[MatrixRTC] initializing Rust Crypto for AUDIOBOT device');
+      console.log(`[MatrixRTC] initializing Rust Crypto user=${session.userId} device=${session.deviceId}`);
       await client.initRustCrypto({ useIndexedDB: false });
       client.startClient({ initialSyncLimit: 20 });
       await waitForMatrixPrepared(client, sdk);
       console.log(`[MatrixRTC] sync ready user=${session.userId} device=${session.deviceId}`);
       return client;
     })().catch((error) => {
-      matrixRtcClientPromise = null;
+      matrixRtcClientPromises.delete(clientKey);
+      if (matrixRtcClientPromise === clientPromise) matrixRtcClientPromise = null;
       throw error;
     });
+    matrixRtcClientPromises.set(clientKey, clientPromise);
+    if (session === matrixSession || (session.userId === MATRIX_USER_ID && session.deviceId === MATRIX_LOGIN_DEVICE_ID)) {
+      matrixRtcClientPromise = clientPromise;
+    }
   }
-  return matrixRtcClientPromise;
+  return clientPromise;
 }
 
 function applyLiveKitOutboundKey(roomId, key, keyIndex, rtcBackendIdentity) {
@@ -1433,6 +1515,7 @@ function publicArmedCallJob(job) {
   return {
     id: job.id,
     roomId: job.roomId,
+    senderUserId: job.senderUserId || '',
     targetUserId: job.targetUserId || '',
     audio: job.audio,
     repeat: job.repeat,
@@ -1537,7 +1620,7 @@ async function runArmedCallJob(job) {
   let session = null;
   let media = null;
   try {
-    session = await ensureMatrixSession();
+    session = job.matrixSession || await ensureMatrixSession();
     const answered = await waitForArmedCallAnswer(job, session);
     if (!isArmedCallJobCurrent(job)) {
       const error = new Error('call-arm cancelled');
@@ -1952,6 +2035,7 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       service: 'matrix-call-audio-bot-test',
+      version: BOT_VERSION,
       mode: 'latest-matrixrtc-msc4143-msc4354-msc4195-e2ee-audio',
       audioDir: AUDIO_DIR,
       endpoints: {
@@ -1967,6 +2051,9 @@ const server = http.createServer(async (req, res) => {
         matrixToken: 'POST /matrix/token',
         matrixConnect: 'POST /matrix/connect',
         matrixCall: 'POST /matrix/call',
+        matrixCallArm: 'POST /matrix/call-arm',
+        matrixCallCancel: 'POST /matrix/call-cancel',
+        matrixCallArmStatus: 'GET /matrix/call-arm-status',
         matrixHangup: 'POST /matrix/hangup',
         matrixCallAudio: 'POST /matrix/call-audio',
         matrixPlayAudio: 'POST /matrix/play-audio',
@@ -1985,10 +2072,13 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       service: 'matrix-call-audio-bot-test',
+      version: BOT_VERSION,
       uptime: Math.round(process.uptime()),
       jobs: jobs.size,
       audioDir: AUDIO_DIR,
       matrixConfigured: matrixConfigured(),
+      workLinkedSenderSupported: true,
+      dynamicSenderSessionCount: dynamicMatrixSessions.size,
       rtcClean: activeRtcRoomIds.length === 0,
       activeRtcRoomCount: activeRtcRoomIds.length,
       activeRtcRoomIds,
@@ -2411,10 +2501,23 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && url.pathname === '/matrix/call-arm') {
-    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
     try {
       const body = await readJson(req);
-      const session = await ensureMatrixSession();
+      const senderUserId = String(body.senderUserId || '').trim();
+      const senderPassword = String(body.senderPassword || '');
+      const workLinked = Boolean(senderUserId || senderPassword);
+
+      let session;
+      if (workLinked) {
+        if (!senderUserId || !senderPassword) {
+          return sendJson(res, 400, { ok: false, error: 'senderUserId and senderPassword are both required' });
+        }
+        session = await ensureMatrixSessionForCredentials(senderUserId, senderPassword);
+      } else {
+        if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
+        session = await ensureMatrixSession();
+      }
+
       const selected = await discoverJoinedRoom(session, {
         roomId: body.roomId,
         targetUserId: body.targetUserId,
@@ -2465,7 +2568,9 @@ const server = http.createServer(async (req, res) => {
       const job = {
         id: crypto.randomUUID(),
         roomId: selected.roomId,
+        senderUserId: session.userId,
         targetUserId,
+        matrixSession: session,
         audio,
         repeat,
         waitForAnswerMs,
@@ -2482,13 +2587,14 @@ const server = http.createServer(async (req, res) => {
         result: null,
       };
       armedCallJobs.set(selected.roomId, job);
-      console.log(`[call-arm] armed room=${selected.roomId} target=${targetUserId || '*'} audio=${audio} repeat=${repeat}`);
+      console.log(`[call-arm] armed room=${selected.roomId} sender=${session.userId} target=${targetUserId || '*'} audio=${audio} repeat=${repeat} source=${workLinked ? 'work' : 'legacy'}`);
       void runArmedCallJob(job);
 
       return sendJson(res, 202, {
         ok: true,
         status: 'waiting_answer',
         selectedBy: selected.selectedBy,
+        linkedBy: workLinked ? 'work_sender_credentials' : 'legacy_server_account',
         job: publicArmedCallJob(job),
       });
     } catch (e) {
@@ -2502,17 +2608,28 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && url.pathname === '/matrix/call-cancel') {
-    if (!authorized(req)) return sendJson(res, 401, { ok: false, error: 'unauthorized' });
     try {
       const body = await readJson(req);
-      const session = await ensureMatrixSession();
-      const selected = await discoverJoinedRoom(session, {
-        roomId: body.roomId,
-        targetUserId: body.targetUserId,
-      });
-      const job = armedCallJobs.get(selected.roomId);
+      const roomId = String(body.roomId || '').trim();
+      if (!roomId) return sendJson(res, 400, { ok: false, error: 'roomId is required' });
+
+      const job = armedCallJobs.get(roomId);
       if (!job) {
         return sendJson(res, 404, { ok: false, error: 'no call-arm job for this room' });
+      }
+
+      const senderUserId = String(body.senderUserId || '').trim();
+      const senderPassword = String(body.senderPassword || '');
+      if (senderUserId || senderPassword) {
+        if (!senderUserId || !senderPassword) {
+          return sendJson(res, 400, { ok: false, error: 'senderUserId and senderPassword are both required' });
+        }
+        const session = await ensureMatrixSessionForCredentials(senderUserId, senderPassword);
+        if (job.senderUserId && session.userId !== job.senderUserId) {
+          return sendJson(res, 403, { ok: false, error: 'sender account does not match the armed call' });
+        }
+      } else if (!authorized(req)) {
+        return sendJson(res, 401, { ok: false, error: 'unauthorized' });
       }
 
       const terminalStatuses = new Set(['finished', 'failed', 'timeout', 'cancelled']);
@@ -2530,7 +2647,7 @@ const server = http.createServer(async (req, res) => {
         finishedAt: Date.now(),
         error: String(body.reason || 'cancelled by Work'),
       });
-      console.log(`[call-arm] cancel requested room=${selected.roomId} reason=${job.error}`);
+      console.log(`[call-arm] cancel requested room=${roomId} sender=${job.senderUserId || '?'} reason=${job.error}`);
 
       return sendJson(res, 200, {
         ok: true,
@@ -2884,9 +3001,11 @@ async function gracefulShutdown(signal) {
 
   try {
     const cleanup = await disconnectAllRtcRooms();
-    if (matrixRtcClientPromise) {
+    const clientPromises = Array.from(new Set(matrixRtcClientPromises.values()));
+    if (matrixRtcClientPromise) clientPromises.push(matrixRtcClientPromise);
+    for (const promise of Array.from(new Set(clientPromises))) {
       try {
-        const client = await matrixRtcClientPromise;
+        const client = await promise;
         client?.stopClient?.();
       } catch (error) {
         console.warn(`[Shutdown] Matrix client stop failed: ${error?.message || error}`);
