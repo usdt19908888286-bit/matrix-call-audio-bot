@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.8';
+const BOT_VERSION = '2026.08.16.9';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
@@ -1376,7 +1376,7 @@ async function waitForExistingAnsweredRtcCall(rtcSession, session, timeoutMs = 1
   }
 }
 
-async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs = 15000, options = {}) {
+async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs = 15000) {
   const client = await ensureMatrixRtcClient(session);
   const { rtc: rtcModule } = await loadMatrixRtcSdk();
   let room = client.getRoom(roomId);
@@ -1400,22 +1400,12 @@ async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs =
     throw error;
   }
 
-  const answeredMemberships = Array.isArray(options.answeredMemberships) ? options.answeredMemberships : [];
-  const existingCall = answeredMemberships.length
-    ? { waitedMs: 0, memberships: answeredMemberships, reusedAnswerDetection: true }
-    : await waitForExistingAnsweredRtcCall(rtcSession, session, waitForAnsweredMs);
+  const existingCall = await waitForExistingAnsweredRtcCall(rtcSession, session, waitForAnsweredMs);
+  const discovered = await discoverMatrixRtcTransport(session);
   const existingFocus = rtcSession.getFocusInUse?.();
-  let preparedTransport = options.rtcTransport?.livekit_service_url ? options.rtcTransport : null;
-  if (!existingFocus?.livekit_service_url && !preparedTransport && options.rtcPrepPromise) {
-    const prepared = await options.rtcPrepPromise;
-    if (prepared?.ok && prepared.transport?.livekit_service_url) preparedTransport = prepared.transport;
-  }
-  const discovered = (!existingFocus?.livekit_service_url && !preparedTransport)
-    ? await discoverMatrixRtcTransport(session)
-    : null;
   const focus = existingFocus?.type === 'livekit' && existingFocus?.livekit_service_url
     ? { ...existingFocus, livekit_alias: existingFocus.livekit_alias || roomId }
-    : { ...(preparedTransport || discovered.transport), livekit_alias: roomId };
+    : { ...discovered.transport, livekit_alias: roomId };
 
   const attachContext = {
     client,
@@ -1549,72 +1539,59 @@ async function resolveSimpleCallMemberId(session, roomId, active) {
   throw error;
 }
 
-async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000, options = {}) {
-  const startedAt = Date.now();
+async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000) {
+  const totalStartedAt = Date.now();
   let active = simpleOneToOneCalls.get(roomId);
   let attached = null;
 
-  // Preserve the known-good media path. For Work-triggered calls the answered
-  // condition has already been proven, so reuse that result instead of polling it again.
+  // Preserve the known-good VPS-originated path. If the VPS did not originate
+  // this call, look for an already-answered MatrixRTC call and attach without
+  // sending another ring notification.
   if (!active?.rtcSession?.isJoined?.()) {
-    const attachStartedAt = Date.now();
-    attached = await attachToExistingOneToOneCall(session, roomId, waitForRemoteMs, options);
+    const startedAt = Date.now();
+    attached = await attachToExistingOneToOneCall(session, roomId, waitForRemoteMs);
     active = attached.context;
-    console.log(`[latency] attach+e2ee room=${roomId} ms=${Date.now() - attachStartedAt}`);
+    console.log(`[latency] attach-existing room=${roomId} ms=${Date.now() - startedAt}`);
   }
 
+  const memberStartedAt = Date.now();
   const memberId = await resolveSimpleCallMemberId(session, roomId, active);
+  console.log(`[latency] resolve-member room=${roomId} ms=${Date.now() - memberStartedAt}`);
 
+  const keyStartedAt = Date.now();
   if (!active.ownKey && typeof active.rtcSession._onRTCSessionMemberUpdate === 'function') {
     try { await active.rtcSession._onRTCSessionMemberUpdate(); } catch {}
   }
   try { active.rtcSession.reemitEncryptionKeys?.(); } catch {}
   await waitForOwnMatrixRtcKey(active, 15000);
+  console.log(`[latency] e2ee-key-ready room=${roomId} ms=${Date.now() - keyStartedAt}`);
 
-  const transportStartedAt = Date.now();
-  let prepared = options.rtcPrepared || null;
-  if (!prepared && options.rtcPrepPromise) prepared = await options.rtcPrepPromise;
-  if (prepared?.ok && prepared.openId?.access_token && Date.now() - prepared.preparedAt > 30000) {
-    try {
-      prepared = {
-        ...prepared,
-        openId: await requestMatrixOpenId(session),
-        preparedAt: Date.now(),
-        refreshedOpenId: true,
-      };
-    } catch (error) {
-      console.warn(`[call-arm] preflight OpenID refresh failed room=${roomId}: ${error?.message || error}`);
-      prepared = { ok: false, error };
-    }
-  }
-  const rtcTransport = prepared?.ok && prepared.transport?.livekit_service_url
-    ? prepared.transport
-    : options.rtcTransport?.livekit_service_url
-      ? options.rtcTransport
-      : (await discoverMatrixRtcTransport(session)).transport;
-  const openId = prepared?.ok && prepared.openId?.access_token
-    ? prepared.openId
-    : options.openId?.access_token
-      ? options.openId
-      : await requestMatrixOpenId(session);
-  console.log(`[latency] rtc-auth-ready room=${roomId} ms=${Date.now() - transportStartedAt} prewarmed=${Boolean(prepared?.ok)} prepareMs=${prepared?.prepareMs ?? -1}`);
+  const authStartedAt = Date.now();
+  const [rtc, openId] = await Promise.all([
+    discoverMatrixRtcTransport(session),
+    requestMatrixOpenId(session),
+  ]);
+  console.log(`[latency] rtc+openid room=${roomId} ms=${Date.now() - authStartedAt}`);
 
   const tokenStartedAt = Date.now();
-  const livekit = await requestLegacyLiveKitToken(rtcTransport, session, roomId, openId, {
+  const livekit = await requestLegacyLiveKitToken(rtc.transport, session, roomId, openId, {
     memberId,
   });
   console.log(`[latency] livekit-token room=${roomId} ms=${Date.now() - tokenStartedAt}`);
 
   const connectStartedAt = Date.now();
   const connection = await connectLiveKitRoom(roomId, livekit, active);
+  console.log(`[latency] livekit-connect room=${roomId} ms=${Date.now() - connectStartedAt}`);
+
+  const remoteStartedAt = Date.now();
   const remote = await waitForLiveKitRemoteParticipant(roomId, waitForRemoteMs);
-  console.log(`[latency] livekit-connect+remote room=${roomId} ms=${Date.now() - connectStartedAt}`);
+  console.log(`[latency] remote-participant room=${roomId} ms=${Date.now() - remoteStartedAt}`);
+  console.log(`[latency] media-total room=${roomId} ms=${Date.now() - totalStartedAt}`);
   return {
     active,
     livekit,
     connection,
     remote,
-    mediaConnectMs: Date.now() - startedAt,
     callSource: active.source || 'vps_started',
     existingCall: attached?.existingCall || active.existingCall || null,
   };
@@ -1731,7 +1708,6 @@ async function runArmedCallJob(job) {
   let session = null;
   let media = null;
   let ttsTask = null;
-  let rtcPrepTask = null;
   try {
     session = job.matrixSession || await ensureMatrixSession();
     if (job.ttsText) {
@@ -1742,19 +1718,6 @@ async function runArmedCallJob(job) {
         (error) => ({ ok: false, error, synthesizeMs: Date.now() - ttsStartedAt }),
       );
     }
-
-    // Warm only requests that do not join MatrixRTC, so ringing behavior stays unchanged.
-    // OpenID is refreshed after a long ring to avoid using a stale preflight token.
-    const rtcPrepStartedAt = Date.now();
-    rtcPrepTask = Promise.all([
-      discoverMatrixRtcTransport(session),
-      requestMatrixOpenId(session),
-      loadLiveKitRtc(),
-    ]).then(
-      ([rtc, openId]) => ({ ok: true, transport: rtc.transport, openId, preparedAt: Date.now(), prepareMs: Date.now() - rtcPrepStartedAt }),
-      (error) => ({ ok: false, error, preparedAt: Date.now(), prepareMs: Date.now() - rtcPrepStartedAt }),
-    );
-
     const answered = await waitForArmedCallAnswer(job, session);
     if (!isArmedCallJobCurrent(job)) {
       const error = new Error('call-arm cancelled');
@@ -1767,17 +1730,13 @@ async function runArmedCallJob(job) {
       answeredAt: Date.now(),
       answeredMemberships: answered.memberships,
     });
+    console.log(`[latency] answered room=${job.roomId} at=${job.answeredAt}`);
 
-    // Reuse the verified media path, but skip only the duplicate answered poll.
-    // Keep preflight running in parallel with attach/E2EE instead of blocking on it.
-    // No iOS/media-ready gate is inserted here: the proven publish/subscription path remains intact.
+    // Reuse the exact external-call attach path that has already been verified
+    // to produce audible encrypted media without sending another ring.
     updateArmedCallJob(job, { status: 'attaching' });
-    const mediaStartedAt = Date.now();
-    media = await connectSimpleCallMedia(session, job.roomId, job.waitForRemoteMs, {
-      answeredMemberships: answered.memberships,
-      rtcPrepPromise: rtcPrepTask,
-    });
-    console.log(`[latency] answer-to-livekit-ready room=${job.roomId} ms=${Date.now() - mediaStartedAt}`);
+    media = await connectSimpleCallMedia(session, job.roomId, job.waitForRemoteMs);
+    console.log(`[latency] answer-to-media-ready room=${job.roomId} ms=${Date.now() - job.answeredAt}`);
 
     if (!isArmedCallJobCurrent(job)) {
       const error = new Error('call-arm cancelled before playback');
@@ -1786,7 +1745,6 @@ async function runArmedCallJob(job) {
     }
 
     updateArmedCallJob(job, { status: 'playing', startedPlayingAt: Date.now() });
-    console.log(`[latency] answer-to-publish-start room=${job.roomId} ms=${Date.now() - (job.answeredAt || Date.now())}`);
     let playback;
     let tts = null;
     if (job.ttsText) {
@@ -1800,6 +1758,7 @@ async function runArmedCallJob(job) {
         synthesizeMs: prepared.synthesizeMs,
       };
       console.log(`[call-arm] playing room=${job.roomId} tts=microsoft voice=${synthesized.voice} repeat=${job.repeat} source=${media.callSource}`);
+      console.log(`[latency] answer-to-publish-start room=${job.roomId} ms=${Date.now() - job.answeredAt}`);
       playback = await publishWavToLiveKit(job.roomId, 'tts', job.repeat, synthesized.wav);
     } else {
       console.log(`[call-arm] playing room=${job.roomId} audio=${job.audio} repeat=${job.repeat} source=${media.callSource}`);
@@ -2173,7 +2132,7 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1, wavBufferOverr
       );
       await new Promise((resolve) => setTimeout(resolve, 150));
     }
-    let firstFrameSentAt = 0;
+    let firstFrameSent = false;
     for (let loop = 0; loop < loops; loop++) {
       for (let start = 0; start < wav.samples.length; start += frameSampleCount) {
         const end = Math.min(start + frameSampleCount, wav.samples.length);
@@ -2182,9 +2141,9 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1, wavBufferOverr
         if (actualSamplesPerChannel <= 0) continue;
         const aligned = frameData.slice(0, actualSamplesPerChannel * wav.channels);
         await source.captureFrame(new AudioFrame(aligned, wav.sampleRate, wav.channels, actualSamplesPerChannel));
-        if (!firstFrameSentAt) {
-          firstFrameSentAt = Date.now();
-          console.log(`[latency] first-pcm-frame room=${roomId} track=${publication?.sid || track.sid || '?'} at=${firstFrameSentAt}`);
+        if (!firstFrameSent) {
+          firstFrameSent = true;
+          console.log(`[latency] first-pcm-frame room=${roomId} track=${publication?.sid || track.sid || '?'}`);
         }
       }
     }
