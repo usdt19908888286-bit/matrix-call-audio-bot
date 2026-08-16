@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.6';
+const BOT_VERSION = '2026.08.16.7';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
@@ -12,6 +12,10 @@ const AZURE_SPEECH_REGION = String(process.env.AZURE_SPEECH_REGION || '').trim()
 const AZURE_TTS_VOICE = String(process.env.AZURE_TTS_VOICE || 'zh-CN-XiaoxiaoNeural').trim() || 'zh-CN-XiaoxiaoNeural';
 const AZURE_TTS_LOCALE = String(process.env.AZURE_TTS_LOCALE || 'zh-CN').trim() || 'zh-CN';
 const AZURE_TTS_OUTPUT_FORMAT = 'riff-16khz-16bit-mono-pcm';
+const REMOTE_MEDIA_READY_TIMEOUT_RAW = Number(process.env.REMOTE_MEDIA_READY_TIMEOUT_MS || 2500);
+const REMOTE_MEDIA_READY_TIMEOUT_MS = Number.isFinite(REMOTE_MEDIA_READY_TIMEOUT_RAW)
+  ? Math.max(0, Math.min(10000, Math.round(REMOTE_MEDIA_READY_TIMEOUT_RAW)))
+  : 2500;
 const MATRIX_HOMESERVER = String(process.env.MATRIX_HOMESERVER || '').replace(/\/$/, '');
 const MATRIX_USER_ID = String(process.env.MATRIX_USER_ID || '').trim();
 const MATRIX_PASSWORD = String(process.env.MATRIX_PASSWORD || '');
@@ -1203,6 +1207,101 @@ async function waitForLiveKitRemoteParticipant(roomId, timeoutMs = 45000) {
   }
 }
 
+function liveKitParticipantPublications(participant) {
+  if (!participant) return [];
+  try {
+    if (typeof participant.getTrackPublications === 'function') {
+      const publications = participant.getTrackPublications();
+      if (Array.isArray(publications)) return publications;
+      if (publications && typeof publications.values === 'function') return Array.from(publications.values());
+      if (publications && Symbol.iterator in Object(publications)) return Array.from(publications);
+    }
+  } catch {}
+  const candidates = [participant.trackPublications, participant.audioTrackPublications];
+  for (const collection of candidates) {
+    if (!collection) continue;
+    try {
+      if (typeof collection.values === 'function') return Array.from(collection.values());
+      if (Array.isArray(collection)) return collection;
+      if (Symbol.iterator in Object(collection)) return Array.from(collection);
+    } catch {}
+  }
+  return [];
+}
+
+function liveKitParticipantMatchesUser(participant, targetUserId) {
+  const identity = String(participant?.identity || '');
+  const target = String(targetUserId || '').trim();
+  if (!target) return true;
+  return identity === target || identity.startsWith(`${target}:`);
+}
+
+async function inspectRemoteMediaReady(roomId, targetUserId = '') {
+  const connection = liveKitConnections.get(roomId);
+  const room = connection?.room;
+  if (!room?.isConnected) {
+    return { ready: false, reason: 'livekit_not_connected' };
+  }
+
+  const { TrackKind } = await loadLiveKitRtc();
+  const participants = Array.from(room.remoteParticipants.values())
+    .filter((participant) => liveKitParticipantMatchesUser(participant, targetUserId));
+
+  for (const participant of participants) {
+    const publications = liveKitParticipantPublications(participant);
+    for (const publication of publications) {
+      const kind = publication?.kind ?? publication?.track?.kind;
+      if (kind !== TrackKind?.KIND_AUDIO) continue;
+      // Requiring the subscribed track object is stronger than merely seeing a
+      // LiveKit participant. On iOS this arrives only after the call media path
+      // has come up, which is a much better playback gate for lock-screen answers.
+      if (!publication?.track) continue;
+      return {
+        ready: true,
+        participantIdentity: participant.identity || '',
+        participantSid: participant.sid || null,
+        trackSid: publication.sid || publication.trackSid || publication?.track?.sid || null,
+        trackName: publication.name || publication?.track?.name || '',
+        trackSource: publication.source ?? publication?.track?.source ?? null,
+        muted: Boolean(publication.muted ?? publication.isMuted ?? publication?.track?.muted ?? false),
+      };
+    }
+  }
+
+  return {
+    ready: false,
+    reason: participants.length ? 'target_audio_track_not_ready' : 'target_participant_not_ready',
+    participantCount: participants.length,
+  };
+}
+
+async function waitForRemoteMediaReady(roomId, targetUserId = '', timeoutMs = REMOTE_MEDIA_READY_TIMEOUT_MS) {
+  const startedAt = Date.now();
+  const waitMs = Math.max(0, Math.min(10000, Math.round(Number(timeoutMs) || 0)));
+  let last = { ready: false, reason: 'not_checked' };
+
+  while (true) {
+    last = await inspectRemoteMediaReady(roomId, targetUserId);
+    if (last.ready) {
+      const result = { ...last, waitedMs: Date.now() - startedAt, fallback: false };
+      console.log(`[media-ready] ready room=${roomId} target=${targetUserId || '*'} participant=${result.participantIdentity || '?'} track=${result.trackSid || '?'} waited=${result.waitedMs}ms`);
+      return result;
+    }
+
+    const elapsed = Date.now() - startedAt;
+    if (elapsed >= waitMs) {
+      // Some clients may join with the microphone disabled and therefore never
+      // publish an audio track. Preserve compatibility by falling back instead
+      // of failing the whole call, but surface the fallback in job diagnostics.
+      const result = { ...last, ready: false, waitedMs: elapsed, fallback: true };
+      console.warn(`[media-ready] fallback room=${roomId} target=${targetUserId || '*'} reason=${last.reason || 'timeout'} waited=${elapsed}ms`);
+      return result;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 async function stopSimpleOneToOneCall(session, roomId) {
   const active = simpleOneToOneCalls.get(roomId);
   if (liveKitConnections.has(roomId)) {
@@ -1376,7 +1475,7 @@ async function waitForExistingAnsweredRtcCall(rtcSession, session, timeoutMs = 1
   }
 }
 
-async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs = 15000) {
+async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs = 15000, options = {}) {
   const client = await ensureMatrixRtcClient(session);
   const { rtc: rtcModule } = await loadMatrixRtcSdk();
   let room = client.getRoom(roomId);
@@ -1400,12 +1499,16 @@ async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs =
     throw error;
   }
 
-  const existingCall = await waitForExistingAnsweredRtcCall(rtcSession, session, waitForAnsweredMs);
-  const discovered = await discoverMatrixRtcTransport(session);
+  const answeredMemberships = Array.isArray(options.answeredMemberships) ? options.answeredMemberships : [];
+  const existingCall = answeredMemberships.length >= 2
+    ? { waitedMs: 0, memberships: answeredMemberships, reusedAnswerDetection: true }
+    : await waitForExistingAnsweredRtcCall(rtcSession, session, waitForAnsweredMs);
+  const preparedTransport = options.rtcTransport?.livekit_service_url ? options.rtcTransport : null;
+  const discovered = preparedTransport ? null : await discoverMatrixRtcTransport(session);
   const existingFocus = rtcSession.getFocusInUse?.();
   const focus = existingFocus?.type === 'livekit' && existingFocus?.livekit_service_url
     ? { ...existingFocus, livekit_alias: existingFocus.livekit_alias || roomId }
-    : { ...discovered.transport, livekit_alias: roomId };
+    : { ...(preparedTransport || discovered.transport), livekit_alias: roomId };
 
   const attachContext = {
     client,
@@ -1539,7 +1642,7 @@ async function resolveSimpleCallMemberId(session, roomId, active) {
   throw error;
 }
 
-async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000) {
+async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000, options = {}) {
   let active = simpleOneToOneCalls.get(roomId);
   let attached = null;
 
@@ -1547,7 +1650,10 @@ async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000) 
   // this call, look for an already-answered MatrixRTC call and attach without
   // sending another ring notification.
   if (!active?.rtcSession?.isJoined?.()) {
-    attached = await attachToExistingOneToOneCall(session, roomId, waitForRemoteMs);
+    attached = await attachToExistingOneToOneCall(session, roomId, waitForRemoteMs, {
+      answeredMemberships: options.answeredMemberships,
+      rtcTransport: options.rtcTransport,
+    });
     active = attached.context;
   }
 
@@ -1559,9 +1665,11 @@ async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000) 
   try { active.rtcSession.reemitEncryptionKeys?.(); } catch {}
   await waitForOwnMatrixRtcKey(active, 15000);
 
-  const rtc = await discoverMatrixRtcTransport(session);
-  const openId = await requestMatrixOpenId(session);
-  const livekit = await requestLegacyLiveKitToken(rtc.transport, session, roomId, openId, {
+  const rtcTransport = options.rtcTransport?.livekit_service_url
+    ? options.rtcTransport
+    : (await discoverMatrixRtcTransport(session)).transport;
+  const openId = options.openId?.access_token ? options.openId : await requestMatrixOpenId(session);
+  const livekit = await requestLegacyLiveKitToken(rtcTransport, session, roomId, openId, {
     memberId,
   });
   const connection = await connectLiveKitRoom(roomId, livekit, active);
@@ -1591,6 +1699,8 @@ function publicArmedCallJob(job) {
     updatedAt: job.updatedAt,
     deadlineAt: job.deadlineAt,
     answeredAt: job.answeredAt || null,
+    mediaReadyAt: job.mediaReadyAt || null,
+    mediaReady: job.mediaReady || undefined,
     startedPlayingAt: job.startedPlayingAt || null,
     finishedAt: job.finishedAt || null,
     error: job.error || undefined,
@@ -1687,6 +1797,7 @@ async function runArmedCallJob(job) {
   let session = null;
   let media = null;
   let ttsTask = null;
+  let rtcPrepTask = null;
   try {
     session = job.matrixSession || await ensureMatrixSession();
     if (job.ttsText) {
@@ -1697,6 +1808,19 @@ async function runArmedCallJob(job) {
         (error) => ({ ok: false, error, synthesizeMs: Date.now() - ttsStartedAt }),
       );
     }
+
+    // These requests do not join MatrixRTC and therefore do not affect ringing.
+    // Warm them while the phone is ringing so the post-answer critical path only
+    // has to attach, obtain the per-device E2EE key, mint the LiveKit token and connect.
+    const rtcPrepStartedAt = Date.now();
+    rtcPrepTask = Promise.all([
+      discoverMatrixRtcTransport(session),
+      requestMatrixOpenId(session),
+    ]).then(
+      ([rtc, openId]) => ({ ok: true, transport: rtc.transport, openId, prepareMs: Date.now() - rtcPrepStartedAt }),
+      (error) => ({ ok: false, error, prepareMs: Date.now() - rtcPrepStartedAt }),
+    );
+
     const answered = await waitForArmedCallAnswer(job, session);
     if (!isArmedCallJobCurrent(job)) {
       const error = new Error('call-arm cancelled');
@@ -1710,13 +1834,45 @@ async function runArmedCallJob(job) {
       answeredMemberships: answered.memberships,
     });
 
-    // Reuse the exact external-call attach path that has already been verified
-    // to produce audible encrypted media without sending another ring.
+    const rtcPrepared = rtcPrepTask ? await rtcPrepTask : null;
+    if (rtcPrepared?.ok) {
+      console.log(`[call-arm] RTC preflight ready room=${job.roomId} prepare=${rtcPrepared.prepareMs}ms`);
+    } else if (rtcPrepared?.error) {
+      console.warn(`[call-arm] RTC preflight failed; falling back to post-answer requests room=${job.roomId} error=${rtcPrepared.error?.message || rtcPrepared.error}`);
+    }
+
+    // Reuse the verified external-call attach path, but do not wait for the
+    // answered condition a second time: waitForArmedCallAnswer already proved it.
     updateArmedCallJob(job, { status: 'attaching' });
-    media = await connectSimpleCallMedia(session, job.roomId, job.waitForRemoteMs);
+    media = await connectSimpleCallMedia(session, job.roomId, job.waitForRemoteMs, {
+      answeredMemberships: answered.memberships,
+      rtcTransport: rtcPrepared?.ok ? rtcPrepared.transport : null,
+      openId: rtcPrepared?.ok ? rtcPrepared.openId : null,
+    });
 
     if (!isArmedCallJobCurrent(job)) {
       const error = new Error('call-arm cancelled before playback');
+      error.code = 'CALL_ARM_CANCELLED';
+      throw error;
+    }
+
+    // A LiveKit participant alone is not enough on iOS lock-screen answers: the
+    // CallKit answer can be visible before AVAudioSession/media has actually come up.
+    // Gate playback on the target participant's subscribed audio track when possible.
+    updateArmedCallJob(job, { status: 'waiting_media_ready' });
+    const mediaReady = await waitForRemoteMediaReady(
+      job.roomId,
+      job.targetUserId,
+      job.mediaReadyTimeoutMs ?? REMOTE_MEDIA_READY_TIMEOUT_MS,
+    );
+    updateArmedCallJob(job, {
+      status: 'media_ready',
+      mediaReadyAt: Date.now(),
+      mediaReady,
+    });
+
+    if (!isArmedCallJobCurrent(job)) {
+      const error = new Error('call-arm cancelled while waiting for media ready');
       error.code = 'CALL_ARM_CANCELLED';
       throw error;
     }
@@ -1752,6 +1908,7 @@ async function runArmedCallJob(job) {
     const result = {
       callSource: media.callSource,
       remote: media.remote,
+      mediaReady,
       playback,
       tts: tts || undefined,
       vpsDetach: detach || undefined,
@@ -2190,6 +2347,11 @@ const server = http.createServer(async (req, res) => {
         voice: AZURE_TTS_VOICE,
         locale: AZURE_TTS_LOCALE,
         outputFormat: AZURE_TTS_OUTPUT_FORMAT,
+      },
+      remoteMediaReady: {
+        enabled: true,
+        mode: 'target_livekit_audio_track',
+        timeoutMs: REMOTE_MEDIA_READY_TIMEOUT_MS,
       },
       dynamicSenderSessionCount: dynamicMatrixSessions.size,
       rtcClean: activeRtcRoomIds.length === 0,
@@ -2649,6 +2811,10 @@ const server = http.createServer(async (req, res) => {
       const waitForRemoteMs = Number.isFinite(requestedWaitForRemoteMs)
         ? Math.max(1000, Math.min(30000, Math.round(requestedWaitForRemoteMs)))
         : 15000;
+      const requestedMediaReadyTimeoutMs = Number(body.mediaReadyTimeoutMs);
+      const mediaReadyTimeoutMs = Number.isFinite(requestedMediaReadyTimeoutMs)
+        ? Math.max(0, Math.min(10000, Math.round(requestedMediaReadyTimeoutMs)))
+        : REMOTE_MEDIA_READY_TIMEOUT_MS;
 
       if (ttsText.length > 5000) return sendJson(res, 400, { ok: false, error: 'ttsText is too long (max 5000 chars)' });
       if (ttsText && !azureTtsConfigured()) {
@@ -2698,12 +2864,15 @@ const server = http.createServer(async (req, res) => {
         repeat,
         waitForAnswerMs,
         waitForRemoteMs,
+        mediaReadyTimeoutMs,
         status: 'waiting_answer',
         cancelled: false,
         createdAt: now,
         updatedAt: now,
         deadlineAt: now + waitForAnswerMs,
         answeredAt: null,
+        mediaReadyAt: null,
+        mediaReady: null,
         startedPlayingAt: null,
         finishedAt: null,
         error: '',
