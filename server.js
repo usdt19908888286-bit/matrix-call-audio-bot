@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.6';
+const BOT_VERSION = '2026.08.16.6.1';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
@@ -1618,7 +1618,37 @@ async function waitForArmedCallAnswer(job, session) {
 
   const rtcSession = client.matrixRTC.getRoomSession(room);
   await rtcSession.initialMembershipCalculated;
-  console.log(`[call-arm] waiting for answer room=${job.roomId} target=${job.targetUserId || '*'} timeout=${job.waitForAnswerMs}ms`);
+
+  if (typeof rtcSession._onRTCSessionMemberUpdate === 'function') {
+    try { await rtcSession._onRTCSessionMemberUpdate(); } catch {}
+  }
+
+  const membershipKey = (membership) => [
+    membership?.userId || '',
+    membership?.deviceId || '',
+    membership?.memberId || '',
+    membership?.rtcBackendIdentity || '',
+  ].join('|');
+
+  // Snapshot whatever already existed before this armed call starts watching.
+  // Most importantly, an old target membership from the previous call must not
+  // be treated as a fresh answer for the new ring.
+  const baselineMemberships = Array.isArray(rtcSession.memberships) ? rtcSession.memberships : [];
+  const baselineTargetKeys = new Set(
+    baselineMemberships
+      .filter((membership) => (
+        job.targetUserId
+          ? membership?.userId === job.targetUserId
+          : membership?.userId && membership?.userId !== session.userId
+      ))
+      .map(membershipKey),
+  );
+
+  console.log(`[call-arm] waiting for answer room=${job.roomId} target=${job.targetUserId || '*'} timeout=${job.waitForAnswerMs}ms baselineTarget=${baselineTargetKeys.size}`);
+
+  let stableTargetKey = '';
+  let stableTargetSince = 0;
+  let candidateLogged = false;
 
   while (Date.now() < job.deadlineAt) {
     if (!isArmedCallJobCurrent(job)) {
@@ -1635,31 +1665,46 @@ async function waitForArmedCallAnswer(job, session) {
     const external = memberships.filter((membership) => !(
       membership?.userId === session.userId && membership?.deviceId === session.deviceId
     ));
-    const recentCutoff = job.createdAt - 10000;
-    const isRecentMembership = (membership) => {
-      try {
-        const ts = typeof membership?.createdTs === 'function' ? Number(membership.createdTs()) : 0;
-        return !ts || ts >= recentCutoff;
-      } catch {
-        return true;
-      }
-    };
-    const hasTarget = job.targetUserId
-      ? external.some((membership) => membership?.userId === job.targetUserId && isRecentMembership(membership))
-      : external.some((membership) => membership?.userId !== session.userId && isRecentMembership(membership));
+
     const hasCallerSide = external.some((membership) => (
       !job.targetUserId || membership?.userId !== job.targetUserId || membership?.userId === session.userId
     ));
 
-    // During ringing we normally see only the Work/caller membership. Once B
-    // answers there are at least two memberships external to this VPS device.
-    if (external.length >= 2 && hasTarget && hasCallerSide) {
-      const summary = external.map(summarizeRtcMembership);
-      console.log(`[call-arm] answered room=${job.roomId} members=${summary.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
-      return { rtcSession, memberships: summary };
+    const freshTarget = external.find((membership) => {
+      const isTarget = job.targetUserId
+        ? membership?.userId === job.targetUserId
+        : membership?.userId && membership?.userId !== session.userId;
+      return isTarget && !baselineTargetKeys.has(membershipKey(membership));
+    });
+
+    if (freshTarget && hasCallerSide) {
+      const key = membershipKey(freshTarget);
+      if (key !== stableTargetKey) {
+        stableTargetKey = key;
+        stableTargetSince = Date.now();
+        candidateLogged = false;
+      }
+
+      const heldMs = Date.now() - stableTargetSince;
+      if (!candidateLogged) {
+        console.log(`[call-arm] answer candidate room=${job.roomId} target=${freshTarget.userId || '?'} device=${freshTarget.deviceId || '?'} waiting_stable=600ms`);
+        candidateLogged = true;
+      }
+
+      // Do not let the VPS Bot join on a one-poll/transient membership. The
+      // target must be a NEW membership for this call and remain present first.
+      if (heldMs >= 600) {
+        const summary = external.map(summarizeRtcMembership);
+        console.log(`[call-arm] answered room=${job.roomId} targetStable=${heldMs}ms members=${summary.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
+        return { rtcSession, memberships: summary };
+      }
+    } else {
+      stableTargetKey = '';
+      stableTargetSince = 0;
+      candidateLogged = false;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await new Promise((resolve) => setTimeout(resolve, 150));
   }
 
   const error = new Error(`call-arm timed out waiting for answer after ${job.waitForAnswerMs}ms`);
