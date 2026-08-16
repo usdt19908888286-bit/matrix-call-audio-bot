@@ -1122,6 +1122,7 @@ async function startSimpleOneToOneCall(session, roomId) {
     keyWaiters: new Set(),
     keysSeen: 0,
     startedAt: Date.now(),
+    source: 'vps_started',
   };
 
   rtcSession.on(rtcModule.MatrixRTCSessionEvent.EncryptionKeyChanged, (key, keyIndex, membership, rtcBackendIdentity) => {
@@ -1180,6 +1181,195 @@ async function startSimpleOneToOneCall(session, roomId) {
   }
 }
 
+function summarizeRtcMembership(membership) {
+  return {
+    userId: membership?.userId || membership?.sender || '',
+    deviceId: membership?.deviceId || '',
+    memberId: membership?.memberId || '',
+    rtcBackendIdentity: membership?.rtcBackendIdentity || '',
+    callIntent: membership?.callIntent || '',
+  };
+}
+
+async function waitForExistingAnsweredRtcCall(rtcSession, session, timeoutMs = 15000) {
+  const startedAt = Date.now();
+  const waitMs = Math.max(1000, Math.min(30000, Math.round(Number(timeoutMs) || 15000)));
+  let lastMemberships = [];
+
+  while (true) {
+    if (typeof rtcSession._onRTCSessionMemberUpdate === 'function') {
+      try { await rtcSession._onRTCSessionMemberUpdate(); } catch {}
+    }
+
+    lastMemberships = Array.isArray(rtcSession.memberships) ? rtcSession.memberships : [];
+    const externalMemberships = lastMemberships.filter((membership) => !(
+      membership?.userId === session.userId && membership?.deviceId === session.deviceId
+    ));
+    const remoteAnswered = externalMemberships.some((membership) => membership?.userId !== session.userId);
+
+    // Do not let the VPS join while the phone is still ringing. We only attach
+    // after the existing call already has at least two RTC members and one of
+    // them is another Matrix user (normally the answered B device).
+    if (externalMemberships.length >= 2 && remoteAnswered) {
+      return {
+        waitedMs: Date.now() - startedAt,
+        memberships: externalMemberships.map(summarizeRtcMembership),
+      };
+    }
+
+    if (Date.now() - startedAt >= waitMs) {
+      const error = new Error(`No answered existing MatrixRTC call found within ${waitMs}ms; found ${externalMemberships.length} external RTC member(s)`);
+      error.status = 409;
+      error.existingMemberships = externalMemberships.map(summarizeRtcMembership);
+      throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs = 15000) {
+  const client = await ensureMatrixRtcClient(session);
+  const { rtc: rtcModule } = await loadMatrixRtcSdk();
+  let room = client.getRoom(roomId);
+  if (!room) {
+    await client.joinRoom(roomId);
+    room = client.getRoom(roomId);
+  }
+  if (!room) throw new Error(`Matrix room is not available in matrix-js-sdk: ${roomId}`);
+
+  const rtcSession = client.matrixRTC.getRoomSession(room);
+  await rtcSession.initialMembershipCalculated;
+
+  // A server device must never impersonate an already-present device. This is
+  // especially important when the software caller uses the same Matrix user.
+  const existingOwnDevice = (rtcSession.memberships || []).find((membership) => (
+    membership?.userId === session.userId && membership?.deviceId === session.deviceId
+  ));
+  if (existingOwnDevice && !rtcSession.isJoined?.()) {
+    const error = new Error(`The existing call already contains this VPS Matrix device (${session.deviceId}); refusing to overwrite that membership`);
+    error.status = 409;
+    throw error;
+  }
+
+  const existingCall = await waitForExistingAnsweredRtcCall(rtcSession, session, waitForAnsweredMs);
+  const discovered = await discoverMatrixRtcTransport(session);
+  const existingFocus = rtcSession.getFocusInUse?.();
+  const focus = existingFocus?.type === 'livekit' && existingFocus?.livekit_service_url
+    ? { ...existingFocus, livekit_alias: existingFocus.livekit_alias || roomId }
+    : { ...discovered.transport, livekit_alias: roomId };
+
+  const attachContext = {
+    client,
+    rtcSession,
+    roomId,
+    memberId: '',
+    ownKey: null,
+    ownKeyIndex: null,
+    ownRtcBackendIdentity: '',
+    keyWaiters: new Set(),
+    keysSeen: 0,
+    startedAt: Date.now(),
+    source: 'attached_existing',
+    existingCall,
+    encryptionListener: null,
+    membershipErrorListener: null,
+  };
+
+  attachContext.encryptionListener = (key, keyIndex, membership, rtcBackendIdentity) => {
+    const raw = key instanceof Uint8Array ? new Uint8Array(key) : new Uint8Array(key || []);
+    attachContext.keysSeen += 1;
+    const isOwn = membership?.userId === session.userId && membership?.deviceId === session.deviceId;
+    console.log(`[attach E2EE] key index=${keyIndex} participant=${rtcBackendIdentity || '?'} matrix=${membership?.userId || '?'}/${membership?.deviceId || '?'} own=${isOwn}`);
+    if (!isOwn) return;
+
+    attachContext.memberId = String(membership?.memberId || attachContext.memberId || '');
+    attachContext.ownKey = raw;
+    attachContext.ownKeyIndex = Number(keyIndex || 0);
+    attachContext.ownRtcBackendIdentity = String(rtcBackendIdentity || '');
+    applyLiveKitOutboundKey(roomId, raw, attachContext.ownKeyIndex, attachContext.ownRtcBackendIdentity);
+    for (const waiter of Array.from(attachContext.keyWaiters)) waiter.resolve(attachContext);
+  };
+  attachContext.membershipErrorListener = (error) => {
+    const wrapped = error instanceof Error ? error : new Error(String(error || 'MatrixRTC membership manager error'));
+    console.error('[attach] membership manager error:', wrapped);
+    for (const waiter of Array.from(attachContext.keyWaiters)) waiter.reject(wrapped);
+  };
+
+  rtcSession.on(rtcModule.MatrixRTCSessionEvent.EncryptionKeyChanged, attachContext.encryptionListener);
+  rtcSession.on(rtcModule.MatrixRTCSessionEvent.MembershipManagerError, attachContext.membershipErrorListener);
+
+  try {
+    console.log(`[attach] existing answered call found room=${roomId} members=${existingCall.memberships.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
+    // Deliberately omit notificationType: the software already rang and B has
+    // answered. The VPS joins only as a media sender and must not ring again.
+    rtcSession.joinRoomSession([], focus, {
+      callIntent: 'audio',
+      manageMediaKeys: true,
+    });
+    simpleOneToOneCalls.set(roomId, attachContext);
+
+    if (typeof rtcSession._onRTCSessionMemberUpdate === 'function') {
+      try { await rtcSession._onRTCSessionMemberUpdate(); } catch {}
+    }
+    try { rtcSession.reemitEncryptionKeys?.(); } catch {}
+    await waitForOwnMatrixRtcKey(attachContext, 15000);
+    console.log(`[attach] VPS media membership joined room=${roomId} identity=${attachContext.ownRtcBackendIdentity || '?'}`);
+    return { context: attachContext, existingCall, focus };
+  } catch (error) {
+    simpleOneToOneCalls.delete(roomId);
+    try {
+      if (rtcSession.isJoined?.()) await rtcSession.leaveRoomSession(5000);
+    } catch {}
+    try { rtcSession.off(rtcModule.MatrixRTCSessionEvent.EncryptionKeyChanged, attachContext.encryptionListener); } catch {}
+    try { rtcSession.off(rtcModule.MatrixRTCSessionEvent.MembershipManagerError, attachContext.membershipErrorListener); } catch {}
+    throw error;
+  }
+}
+
+async function detachFromExistingOneToOneCall(session, roomId, active) {
+  if (!active || active.source !== 'attached_existing') return null;
+
+  let left = false;
+  let leaveError = '';
+  try {
+    if (active.rtcSession?.isJoined?.()) {
+      left = Boolean(await active.rtcSession.leaveRoomSession(5000));
+    }
+  } catch (error) {
+    leaveError = String(error?.message || error);
+    console.warn(`[attach] VPS leave failed room=${roomId}: ${leaveError}`);
+  }
+
+  // Remove only the listeners installed by the attach path. Do not stop the
+  // cached room session and do not run broad stale-membership cleanup: the
+  // software caller may use the same Matrix user on a different device.
+  try {
+    const { rtc: rtcModule } = await loadMatrixRtcSdk();
+    if (active.encryptionListener) active.rtcSession?.off?.(rtcModule.MatrixRTCSessionEvent.EncryptionKeyChanged, active.encryptionListener);
+    if (active.membershipErrorListener) active.rtcSession?.off?.(rtcModule.MatrixRTCSessionEvent.MembershipManagerError, active.membershipErrorListener);
+  } catch {}
+
+  if (simpleOneToOneCalls.get(roomId) === active) simpleOneToOneCalls.delete(roomId);
+
+  await new Promise((resolve) => setTimeout(resolve, 350));
+  if (typeof active.rtcSession?._onRTCSessionMemberUpdate === 'function') {
+    try { await active.rtcSession._onRTCSessionMemberUpdate(); } catch {}
+  }
+  const remaining = (active.rtcSession?.memberships || []).filter((membership) => !(
+    membership?.userId === session.userId && membership?.deviceId === session.deviceId
+  ));
+  const remainingMemberships = remaining.map(summarizeRtcMembership);
+  const originalCallStillActive = remaining.length >= 2;
+  console.log(`[attach] VPS detached room=${roomId} left=${left} remaining=${remaining.length} originalActive=${originalCallStillActive}`);
+
+  return {
+    left,
+    leaveError: leaveError || undefined,
+    originalCallStillActive,
+    remainingMemberships,
+  };
+}
+
 async function resolveSimpleCallMemberId(session, roomId, active) {
   if (active?.memberId) return active.memberId;
 
@@ -1201,11 +1391,15 @@ async function resolveSimpleCallMemberId(session, roomId, active) {
 }
 
 async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000) {
-  const active = simpleOneToOneCalls.get(roomId);
+  let active = simpleOneToOneCalls.get(roomId);
+  let attached = null;
+
+  // Preserve the known-good VPS-originated path. If the VPS did not originate
+  // this call, look for an already-answered MatrixRTC call and attach without
+  // sending another ring notification.
   if (!active?.rtcSession?.isJoined?.()) {
-    const error = new Error('No active 1:1 call session. Call /matrix/call first and answer it before playing audio.');
-    error.status = 409;
-    throw error;
+    attached = await attachToExistingOneToOneCall(session, roomId, waitForRemoteMs);
+    active = attached.context;
   }
 
   const memberId = await resolveSimpleCallMemberId(session, roomId, active);
@@ -1223,7 +1417,14 @@ async function connectSimpleCallMedia(session, roomId, waitForRemoteMs = 15000) 
   });
   const connection = await connectLiveKitRoom(roomId, livekit, active);
   const remote = await waitForLiveKitRemoteParticipant(roomId, waitForRemoteMs);
-  return { active, livekit, connection, remote };
+  return {
+    active,
+    livekit,
+    connection,
+    remote,
+    callSource: active.source || 'vps_started',
+    existingCall: attached?.existingCall || active.existingCall || null,
+  };
 }
 
 function summarizeMatrixRtcContext(roomId, context) {
@@ -2061,22 +2262,29 @@ const server = http.createServer(async (req, res) => {
       const media = await connectSimpleCallMedia(session, selected.roomId, waitForRemoteMs);
       const playback = await publishWavToLiveKit(selected.roomId, audio, repeat);
 
-      // Let the last encrypted audio frames leave the sender, then disconnect only
-      // the LiveKit media transport. Keep the 1:1 MatrixRTC session alive so the
-      // phone call itself remains connected until /matrix/hangup is requested.
+      // Let the last encrypted frames leave the sender, then disconnect the VPS
+      // LiveKit transport. If this call came from external software, also leave
+      // only the VPS MatrixRTC membership so the original call remains untouched.
       await new Promise((resolve) => setTimeout(resolve, 700));
       await disconnectLiveKitRoom(selected.roomId);
 
+      const attachedExisting = media.callSource === 'attached_existing';
+      const attachCleanup = attachedExisting
+        ? await detachFromExistingOneToOneCall(session, selected.roomId, media.active)
+        : null;
       const active = simpleOneToOneCalls.get(selected.roomId);
       return sendJson(res, 200, {
         ok: true,
-        status: 'audio_played_call_still_active',
+        status: attachedExisting ? 'audio_played_existing_call_untouched' : 'audio_played_call_still_active',
+        callSource: media.callSource,
         roomId: selected.roomId,
         selectedBy: selected.selectedBy,
         audio,
         repeat,
         remote: media.remote,
         playback,
+        existingCall: media.existingCall || undefined,
+        vpsDetach: attachCleanup || undefined,
         mediaTransport: {
           tokenMode: media.livekit.mode,
           localLiveKitIdentity: media.connection?.localParticipant?.identity || '',
@@ -2087,16 +2295,27 @@ const server = http.createServer(async (req, res) => {
           rtcBackendIdentity: media.active.ownRtcBackendIdentity || '',
           memberId: media.active.memberId || media.livekit.memberId,
         },
-        callStillActive: Boolean(active?.rtcSession?.isJoined?.()),
+        callStillActive: attachedExisting
+          ? Boolean(attachCleanup?.originalCallStillActive)
+          : Boolean(active?.rtcSession?.isJoined?.()),
       });
     } catch (e) {
-      // A media failure must not tear down the already-working 1:1 signaling call.
+      // A media failure must not tear down the software-originated call. Clean up
+      // only media and, when applicable, this VPS device's temporary RTC membership.
       if (selectedRoomId && liveKitConnections.has(selectedRoomId)) {
         await disconnectLiveKitRoom(selectedRoomId).catch(() => {});
+      }
+      if (selectedRoomId) {
+        const active = simpleOneToOneCalls.get(selectedRoomId);
+        if (active?.source === 'attached_existing') {
+          const session = await ensureMatrixSession().catch(() => null);
+          if (session) await detachFromExistingOneToOneCall(session, selectedRoomId, active).catch(() => {});
+        }
       }
       return sendJson(res, e.status || 502, {
         ok: false,
         error: String(e.message || e),
+        existingMemberships: e.existingMemberships || undefined,
         details: e.body || undefined,
       });
     }
