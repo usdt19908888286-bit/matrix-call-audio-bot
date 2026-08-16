@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.6.3';
+const BOT_VERSION = '2026.08.16.6.3.2';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
@@ -1129,7 +1129,7 @@ async function waitForRemoteHangup(job, session, answered) {
         ended: true,
         reason,
         waitedMs: now - startedAt,
-        matrixMissingMs,
+        matrixMissingMs: membershipMissingMs,
         liveKitMissingMs,
         target,
       };
@@ -1352,6 +1352,87 @@ async function waitForOwnMatrixRtcKey(context, timeoutMs = 15000) {
   });
 }
 
+async function waitForOutboundMatrixRtcKeyDelivery(context, timeoutMs = 8000) {
+  const rtcSession = context?.rtcSession;
+  const client = context?.client;
+  if (!rtcSession || !client) return { supported: false, reason: 'missing_context' };
+
+  const startedAt = Date.now();
+  const deadlineAt = startedAt + Math.max(1000, Number(timeoutMs) || 8000);
+  const localUserId = String(client.getUserId?.() || '');
+
+  // The MatrixRTC encryption manager emits our first outbound key before the
+  // async to-device distribution has necessarily finished. Waiting only for
+  // ownKey therefore races the receiver on fast call setup. Force one fresh
+  // membership calculation, then wait until the current key rollout settles.
+  if (typeof rtcSession._onRTCSessionMemberUpdate === 'function') {
+    try { await rtcSession._onRTCSessionMemberUpdate(); } catch {}
+  }
+
+  const manager = rtcSession.encryptionManager;
+  if (!manager) {
+    console.warn(`[E2EE] outbound delivery gate unavailable room=${context.roomId || '?'} reason=no-encryption-manager`);
+    return { supported: false, reason: 'no_encryption_manager' };
+  }
+
+  while (Date.now() < deadlineAt) {
+    const pending = manager.currentKeyDistributionPromise;
+    if (pending) {
+      const remaining = Math.max(1, deadlineAt - Date.now());
+      await Promise.race([
+        Promise.resolve(pending),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timed out waiting for MatrixRTC key distribution')), remaining)),
+      ]);
+      continue;
+    }
+    if (!manager.needToEnsureKeyAgain) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  const expected = (Array.isArray(rtcSession.memberships) ? rtcSession.memberships : [])
+    .filter((membership) => membership?.userId && membership?.userId !== localUserId)
+    .map((membership) => ({
+      userId: String(membership.userId || membership.sender || ''),
+      deviceId: String(membership.deviceId || ''),
+    }))
+    .filter((membership) => membership.userId && membership.deviceId);
+
+  const sharedWith = Array.isArray(manager.outboundSession?.sharedWith)
+    ? manager.outboundSession.sharedWith
+    : [];
+  const missing = expected.filter((target) => !sharedWith.some((shared) => (
+    String(shared?.userId || '') === target.userId
+      && String(shared?.deviceId || '') === target.deviceId
+  )));
+  if (missing.length) {
+    throw new Error(`MatrixRTC outbound key was not distributed to ${missing.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
+  }
+
+  // encryptAndSendToDevice() resolves when the encrypted batch is queued, not
+  // necessarily after the homeserver has accepted it. Flush the SDK's
+  // to-device queue and wait for it to become empty before publishing media.
+  const queue = client.toDeviceMessageQueue;
+  const store = client.store;
+  if (queue?.sendQueue && store?.getOldestToDeviceBatch) {
+    while (Date.now() < deadlineAt) {
+      try { await queue.sendQueue(); } catch {}
+      let pendingBatch = null;
+      try { pendingBatch = await store.getOldestToDeviceBatch(); } catch {}
+      if (!pendingBatch && !queue.sending) {
+        const waitedMs = Date.now() - startedAt;
+        console.log(`[E2EE] outbound MatrixRTC key delivered room=${context.roomId || '?'} recipients=${expected.length} waited=${waitedMs}ms`);
+        return { supported: true, delivered: true, recipients: expected.length, waitedMs };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`Timed out waiting for MatrixRTC to-device key queue to flush after ${Date.now() - startedAt}ms`);
+  }
+
+  const waitedMs = Date.now() - startedAt;
+  console.log(`[E2EE] outbound MatrixRTC key distribution settled room=${context.roomId || '?'} recipients=${expected.length} waited=${waitedMs}ms queueCheck=unavailable`);
+  return { supported: true, delivered: false, recipients: expected.length, waitedMs };
+}
+
 async function ensureMatrixRtcE2ee(session, roomId, transport, joinOptions = {}) {
   let context = matrixRtcContexts.get(roomId);
   if (context?.rtcSession?.isJoined?.() && context.ownKey) return context;
@@ -1459,6 +1540,7 @@ async function ensureMatrixRtcE2ee(session, roomId, transport, joinOptions = {})
 
   try { rtcSession.reemitEncryptionKeys?.(); } catch {}
   await waitForOwnMatrixRtcKey(context);
+  await waitForOutboundMatrixRtcKeyDelivery(context, 8000);
   return context;
 }
 
@@ -1788,6 +1870,7 @@ async function attachToExistingOneToOneCall(session, roomId, waitForAnsweredMs =
     }
     try { rtcSession.reemitEncryptionKeys?.(); } catch {}
     await waitForOwnMatrixRtcKey(attachContext, 15000);
+    await waitForOutboundMatrixRtcKeyDelivery(attachContext, 8000);
     console.log(`[attach] VPS media membership joined room=${roomId} identity=${attachContext.ownRtcBackendIdentity || '?'}`);
     return { context: attachContext, existingCall, focus };
   } catch (error) {
