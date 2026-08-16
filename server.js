@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.6.2';
+const BOT_VERSION = '2026.08.16.6.3';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
 const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
@@ -19,6 +19,14 @@ const LIVEKIT_ACTIVE_STABLE_RAW = Number(process.env.LIVEKIT_ACTIVE_STABLE_MS ||
 const LIVEKIT_ACTIVE_STABLE_MS = Number.isFinite(LIVEKIT_ACTIVE_STABLE_RAW)
   ? Math.max(100, Math.min(3000, Math.round(LIVEKIT_ACTIVE_STABLE_RAW)))
   : 250;
+const REMOTE_HANGUP_STABLE_RAW = Number(process.env.REMOTE_HANGUP_STABLE_MS || 1000);
+const REMOTE_HANGUP_STABLE_MS = Number.isFinite(REMOTE_HANGUP_STABLE_RAW)
+  ? Math.max(300, Math.min(5000, Math.round(REMOTE_HANGUP_STABLE_RAW)))
+  : 1000;
+const REMOTE_HANGUP_WATCH_TIMEOUT_RAW = Number(process.env.REMOTE_HANGUP_WATCH_TIMEOUT_MS || 1800000);
+const REMOTE_HANGUP_WATCH_TIMEOUT_MS = Number.isFinite(REMOTE_HANGUP_WATCH_TIMEOUT_RAW)
+  ? Math.max(60000, Math.min(4 * 60 * 60 * 1000, Math.round(REMOTE_HANGUP_WATCH_TIMEOUT_RAW)))
+  : 1800000;
 const MATRIX_HOMESERVER = String(process.env.MATRIX_HOMESERVER || '').replace(/\/$/, '');
 const MATRIX_USER_ID = String(process.env.MATRIX_USER_ID || '').trim();
 const MATRIX_PASSWORD = String(process.env.MATRIX_PASSWORD || '');
@@ -950,6 +958,217 @@ async function lookupLiveKitParticipant(matrixRoomId, rtcBackendIdentity) {
   return { found: false, active: false, reason: 'participant_not_found' };
 }
 
+function rtcMembershipKey(membership) {
+  return [
+    membership?.userId || membership?.sender || '',
+    membership?.deviceId || '',
+    membership?.memberId || '',
+    membership?.rtcBackendIdentity || '',
+  ].join('|');
+}
+
+function rtcMembershipMatchesSnapshot(membership, snapshot) {
+  if (!membership || !snapshot) return false;
+  const userId = String(snapshot.userId || '');
+  if (userId && String(membership?.userId || membership?.sender || '') !== userId) return false;
+  const deviceId = String(snapshot.deviceId || '');
+  if (deviceId) return String(membership?.deviceId || '') === deviceId;
+  const rtcIdentity = String(snapshot.rtcBackendIdentity || '');
+  if (rtcIdentity) return String(membership?.rtcBackendIdentity || '') === rtcIdentity;
+  const memberId = String(snapshot.memberId || '');
+  if (memberId) return String(membership?.memberId || '') === memberId;
+  return false;
+}
+
+function rememberExternalCallerDevices(job, memberships, session) {
+  const known = new Set(Array.isArray(job.callerDeviceIds) ? job.callerDeviceIds : []);
+  for (const membership of memberships || []) {
+    if (membership?.userId !== session.userId) continue;
+    const deviceId = String(membership?.deviceId || '').trim();
+    if (!deviceId || deviceId === session.deviceId) continue;
+    known.add(deviceId);
+  }
+  job.callerDeviceIds = Array.from(known);
+  return job.callerDeviceIds;
+}
+
+function findRecentTargetRtcDecline(room, job) {
+  const events = room?.getLiveTimeline?.()?.getEvents?.() || [];
+  const cutoff = Number(job?.createdAt || 0) - 1000;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    if (event?.getType?.() !== 'org.matrix.msc4310.rtc.decline') continue;
+    if (job?.targetUserId && event?.getSender?.() !== job.targetUserId) continue;
+    const ts = Number(event?.getTs?.() || 0);
+    if (ts && ts < cutoff) continue;
+    return {
+      eventId: event?.getId?.() || '',
+      sender: event?.getSender?.() || '',
+      ts: ts || null,
+      relatesToEventId: event?.getContent?.()?.['m.relates_to']?.event_id || '',
+    };
+  }
+  return null;
+}
+
+async function clearExternalCallerRtcMemberships(job, session) {
+  const wanted = new Set((job?.callerDeviceIds || []).map((value) => String(value || '').trim()).filter(Boolean));
+  const cleared = [];
+  const state = await matrixRoomState(session, job.roomId).catch(() => []);
+  for (const event of state) {
+    if (event?.type !== 'org.matrix.msc3401.call.member') continue;
+    if (event?.sender !== session.userId) continue;
+    const content = event?.content || {};
+    const deviceId = String(content?.device_id || '').trim();
+    const stateKey = String(event?.state_key || '');
+    if (!deviceId || deviceId === session.deviceId || !stateKey || content?.application !== 'm.call') continue;
+    if (wanted.size && !wanted.has(deviceId)) continue;
+    try {
+      await matrixRequest(
+        'PUT',
+        `/_matrix/client/v3/rooms/${encodeURIComponent(job.roomId)}/state/org.matrix.msc3401.call.member/${encodeURIComponent(stateKey)}`,
+        {},
+        session.accessToken,
+      );
+      cleared.push({ type: 'legacy', deviceId, stateKey });
+      console.log(`[remote-hangup] cleared Work caller membership room=${job.roomId} device=${deviceId}`);
+    } catch (error) {
+      console.warn(`[remote-hangup] failed clearing Work caller membership room=${job.roomId} device=${deviceId}: ${error?.message || error}`);
+    }
+  }
+
+  try {
+    const client = await ensureMatrixRtcClient(session);
+    const stickyEvents = await activeRtcEvents(session, job.roomId);
+    for (const event of stickyEvents) {
+      const content = event?.getContent?.() || {};
+      const member = content?.member || {};
+      const deviceId = String(member?.device_id || '').trim();
+      const memberId = String(member?.id || '').trim();
+      if (member?.user_id !== session.userId || !deviceId || deviceId === session.deviceId || !memberId) continue;
+      if (wanted.size && !wanted.has(deviceId)) continue;
+      try {
+        await client._unstable_sendStickyEvent(
+          job.roomId,
+          60 * 60 * 1000,
+          null,
+          'org.matrix.msc4143.rtc.member',
+          { msc4354_sticky_key: memberId },
+        );
+        cleared.push({ type: 'sticky', deviceId, memberId });
+        console.log(`[remote-hangup] cleared sticky caller membership room=${job.roomId} device=${deviceId}`);
+      } catch (error) {
+        console.warn(`[remote-hangup] failed clearing sticky caller membership room=${job.roomId} device=${deviceId}: ${error?.message || error}`);
+      }
+    }
+  } catch {}
+
+  return { cleared };
+}
+
+async function waitForRemoteHangup(job, session, answered) {
+  const rtcSession = answered?.rtcSession;
+  const target = answered?.targetMembership;
+  if (!rtcSession || !target) return { ended: false, reason: 'target_not_available' };
+
+  const startedAt = Date.now();
+  const deadlineAt = startedAt + REMOTE_HANGUP_WATCH_TIMEOUT_MS;
+  let membershipMissingSince = 0;
+  let liveKitMissingSince = 0;
+  let missingLogged = false;
+
+  console.log(`[remote-hangup] watching room=${job.roomId} target=${target.userId || '?'} device=${target.deviceId || '?'} stable=${REMOTE_HANGUP_STABLE_MS}ms`);
+
+  while (Date.now() < deadlineAt) {
+    if (job.cancelled) {
+      const error = new Error('call-arm cancelled');
+      error.code = 'CALL_ARM_CANCELLED';
+      throw error;
+    }
+    if (job.stopRemoteHangupWatch) return { ended: false, reason: 'stopped' };
+
+    if (typeof rtcSession._onRTCSessionMemberUpdate === 'function') {
+      try { await rtcSession._onRTCSessionMemberUpdate(); } catch {}
+    }
+    const memberships = Array.isArray(rtcSession.memberships) ? rtcSession.memberships : [];
+    rememberExternalCallerDevices(job, memberships, session);
+    const targetPresent = memberships.some((membership) => rtcMembershipMatchesSnapshot(membership, target));
+    const now = Date.now();
+
+    if (!targetPresent) {
+      if (!membershipMissingSince) membershipMissingSince = now;
+    } else {
+      membershipMissingSince = 0;
+    }
+
+    const connection = liveKitConnections.get(job.roomId);
+    if (job.status === 'playing' && connection?.room?.isConnected && target.rtcBackendIdentity) {
+      const remoteIdentities = Array.from(connection.room.remoteParticipants?.keys?.() || []);
+      const targetLiveKitPresent = remoteIdentities.includes(String(target.rtcBackendIdentity));
+      if (!targetLiveKitPresent) {
+        if (!liveKitMissingSince) liveKitMissingSince = now;
+      } else {
+        liveKitMissingSince = 0;
+      }
+    } else {
+      liveKitMissingSince = 0;
+    }
+
+    const membershipMissingMs = membershipMissingSince ? now - membershipMissingSince : 0;
+    const liveKitMissingMs = liveKitMissingSince ? now - liveKitMissingSince : 0;
+    if ((membershipMissingMs || liveKitMissingMs) && !missingLogged) {
+      console.log(`[remote-hangup] candidate room=${job.roomId} matrixMissing=${membershipMissingMs}ms livekitMissing=${liveKitMissingMs}ms`);
+      missingLogged = true;
+    }
+    if (!membershipMissingMs && !liveKitMissingMs) missingLogged = false;
+
+    if (membershipMissingMs >= REMOTE_HANGUP_STABLE_MS || liveKitMissingMs >= REMOTE_HANGUP_STABLE_MS) {
+      const reason = liveKitMissingMs >= REMOTE_HANGUP_STABLE_MS ? 'livekit_participant_left' : 'matrix_membership_left';
+      console.log(`[remote-hangup] confirmed room=${job.roomId} reason=${reason} matrixMissing=${membershipMissingMs}ms livekitMissing=${liveKitMissingMs}ms`);
+      return {
+        ended: true,
+        reason,
+        waitedMs: now - startedAt,
+        matrixMissingMs,
+        liveKitMissingMs,
+        target,
+      };
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  return { ended: false, reason: 'watch_timeout', waitedMs: Date.now() - startedAt };
+}
+
+async function finishRemoteHangupJob(job, session, info, media = null, playback = null, tts = null) {
+  job.stopRemoteHangupWatch = true;
+  const detach = await cleanupArmedCallMedia(job, session);
+  const callerCleanup = await clearExternalCallerRtcMemberships(job, session).catch((error) => ({
+    cleared: [],
+    error: String(error?.message || error),
+  }));
+  const result = {
+    callSource: media?.callSource || undefined,
+    remote: media?.remote || undefined,
+    playback: playback || undefined,
+    tts: tts || undefined,
+    vpsDetach: detach || undefined,
+    originalCallStillActive: false,
+    remoteHangup: info,
+    callerCleanup,
+  };
+  updateArmedCallJob(job, {
+    status: 'remote_hangup',
+    remoteHangupAt: Date.now(),
+    finishedAt: Date.now(),
+    result,
+    error: '',
+  });
+  console.log(`[call-arm] remote_hangup room=${job.roomId} reason=${info?.reason || 'remote_left'} callerCleared=${callerCleanup?.cleared?.length || 0}`);
+  return result;
+}
+
 async function loadMatrixRtcSdk() {
   if (!matrixJsSdkPromise) {
     matrixJsSdkPromise = import('matrix-js-sdk').catch((error) => {
@@ -1699,6 +1918,8 @@ function publicArmedCallJob(job) {
     deadlineAt: job.deadlineAt,
     answeredAt: job.answeredAt || null,
     startedPlayingAt: job.startedPlayingAt || null,
+    remoteHangupAt: job.remoteHangupAt || null,
+    callerDeviceIds: Array.isArray(job.callerDeviceIds) ? job.callerDeviceIds : [],
     finishedAt: job.finishedAt || null,
     error: job.error || undefined,
     result: job.result || undefined,
@@ -1730,17 +1951,11 @@ async function waitForArmedCallAnswer(job, session) {
     try { await rtcSession._onRTCSessionMemberUpdate(); } catch {}
   }
 
-  const membershipKey = (membership) => [
-    membership?.userId || '',
-    membership?.deviceId || '',
-    membership?.memberId || '',
-    membership?.rtcBackendIdentity || '',
-  ].join('|');
-
   // Snapshot whatever already existed before this armed call starts watching.
   // Most importantly, an old target membership from the previous call must not
   // be treated as a fresh answer for the new ring.
   const baselineMemberships = Array.isArray(rtcSession.memberships) ? rtcSession.memberships : [];
+  rememberExternalCallerDevices(job, baselineMemberships, session);
   const baselineTargetKeys = new Set(
     baselineMemberships
       .filter((membership) => (
@@ -1748,7 +1963,7 @@ async function waitForArmedCallAnswer(job, session) {
           ? membership?.userId === job.targetUserId
           : membership?.userId && membership?.userId !== session.userId
       ))
-      .map(membershipKey),
+      .map(rtcMembershipKey),
   );
 
   const useLiveKitReadyGate = liveKitReadyGateConfigured();
@@ -1782,6 +1997,15 @@ async function waitForArmedCallAnswer(job, session) {
     const external = memberships.filter((membership) => !(
       membership?.userId === session.userId && membership?.deviceId === session.deviceId
     ));
+    rememberExternalCallerDevices(job, external, session);
+
+    const decline = findRecentTargetRtcDecline(room, job);
+    if (decline) {
+      const error = new Error(`target declined or ended the ringing call (${decline.sender || job.targetUserId || 'remote'})`);
+      error.code = 'CALL_REMOTE_DECLINED';
+      error.remoteEnd = { ended: true, reason: 'declined', decline };
+      throw error;
+    }
 
     const hasCallerSide = external.some((membership) => (
       !job.targetUserId || membership?.userId !== job.targetUserId || membership?.userId === session.userId
@@ -1791,11 +2015,11 @@ async function waitForArmedCallAnswer(job, session) {
       const isTarget = job.targetUserId
         ? membership?.userId === job.targetUserId
         : membership?.userId && membership?.userId !== session.userId;
-      return isTarget && !baselineTargetKeys.has(membershipKey(membership));
+      return isTarget && !baselineTargetKeys.has(rtcMembershipKey(membership));
     });
 
     if (freshTarget && hasCallerSide) {
-      const key = membershipKey(freshTarget);
+      const key = rtcMembershipKey(freshTarget);
       if (key !== stableTargetKey) {
         stableTargetKey = key;
         stableTargetSince = Date.now();
@@ -1817,8 +2041,9 @@ async function waitForArmedCallAnswer(job, session) {
         // not been configured on the VPS.
         if (heldMs >= 600) {
           const summary = external.map(summarizeRtcMembership);
+          const targetMembership = summarizeRtcMembership(freshTarget);
           console.log(`[call-arm] answered room=${job.roomId} targetStable=${heldMs}ms gate=membership-fallback members=${summary.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
-          return { rtcSession, memberships: summary };
+          return { rtcSession, memberships: summary, targetMembership, callerDeviceIds: [...(job.callerDeviceIds || [])] };
         }
       } else {
         const rtcIdentity = String(freshTarget.rtcBackendIdentity || '').trim();
@@ -1847,8 +2072,9 @@ async function waitForArmedCallAnswer(job, session) {
               }
               if (activeMs >= LIVEKIT_ACTIVE_STABLE_MS) {
                 const summary = external.map(summarizeRtcMembership);
+                const targetMembership = summarizeRtcMembership(freshTarget);
                 console.log(`[call-arm] answered room=${job.roomId} livekitActive=${activeMs}ms targetMembership=${heldMs}ms members=${summary.map((m) => `${m.userId}/${m.deviceId}`).join(', ')}`);
-                return { rtcSession, memberships: summary };
+                return { rtcSession, memberships: summary, targetMembership, callerDeviceIds: [...(job.callerDeviceIds || [])] };
               }
             } else {
               activeParticipantKey = '';
@@ -1904,6 +2130,7 @@ async function runArmedCallJob(job) {
   let session = null;
   let media = null;
   let ttsTask = null;
+  let remoteHangupPromise = null;
   try {
     session = job.matrixSession || await ensureMatrixSession();
     if (job.ttsText) {
@@ -1925,7 +2152,11 @@ async function runArmedCallJob(job) {
       status: 'answered',
       answeredAt: Date.now(),
       answeredMemberships: answered.memberships,
+      targetMembership: answered.targetMembership,
+      callerDeviceIds: answered.callerDeviceIds,
     });
+    remoteHangupPromise = waitForRemoteHangup(job, session, answered);
+    remoteHangupPromise.catch(() => {});
 
     // Reuse the exact external-call attach path that has already been verified
     // to produce audible encrypted media without sending another ring.
@@ -1939,8 +2170,8 @@ async function runArmedCallJob(job) {
     }
 
     updateArmedCallJob(job, { status: 'playing', startedPlayingAt: Date.now() });
-    let playback;
     let tts = null;
+    let playbackPromise;
     if (job.ttsText) {
       const prepared = await ttsTask;
       if (!prepared?.ok) throw prepared?.error || new Error('Microsoft TTS synthesis failed');
@@ -1952,19 +2183,53 @@ async function runArmedCallJob(job) {
         synthesizeMs: prepared.synthesizeMs,
       };
       console.log(`[call-arm] playing room=${job.roomId} tts=microsoft voice=${synthesized.voice} repeat=${job.repeat} source=${media.callSource}`);
-      playback = await publishWavToLiveKit(job.roomId, 'tts', job.repeat, synthesized.wav);
+      playbackPromise = publishWavToLiveKit(job.roomId, 'tts', job.repeat, synthesized.wav);
     } else {
       console.log(`[call-arm] playing room=${job.roomId} audio=${job.audio} repeat=${job.repeat} source=${media.callSource}`);
-      playback = await publishWavToLiveKit(job.roomId, job.audio, job.repeat);
+      playbackPromise = publishWavToLiveKit(job.roomId, job.audio, job.repeat);
     }
 
+    const firstOutcome = await Promise.race([
+      playbackPromise.then(
+        (playback) => ({ type: 'playback', playback }),
+        (error) => ({ type: 'playback_error', error }),
+      ),
+      remoteHangupPromise.then(
+        (info) => ({ type: 'remote', info }),
+        (error) => ({ type: 'watch_error', error }),
+      ),
+    ]);
+
+    if (firstOutcome.type === 'watch_error') throw firstOutcome.error;
+    if (firstOutcome.type === 'remote' && firstOutcome.info?.ended) {
+      playbackPromise.catch(() => {});
+      await finishRemoteHangupJob(job, session, firstOutcome.info, media, null, tts);
+      return;
+    }
+    if (firstOutcome.type === 'playback_error') throw firstOutcome.error;
+
+    const playback = firstOutcome.type === 'playback'
+      ? firstOutcome.playback
+      : await playbackPromise;
     if (!isArmedCallJobCurrent(job)) {
       const error = new Error('call-arm cancelled during playback');
       error.code = 'CALL_ARM_CANCELLED';
       throw error;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    const settleOutcome = await Promise.race([
+      new Promise((resolve) => setTimeout(() => resolve({ type: 'settled' }), 700)),
+      remoteHangupPromise.then(
+        (info) => ({ type: 'remote', info }),
+        (error) => ({ type: 'watch_error', error }),
+      ),
+    ]);
+    if (settleOutcome.type === 'watch_error') throw settleOutcome.error;
+    if (settleOutcome.type === 'remote' && settleOutcome.info?.ended) {
+      await finishRemoteHangupJob(job, session, settleOutcome.info, media, playback, tts);
+      return;
+    }
+
     const detach = await cleanupArmedCallMedia(job, session);
     const result = {
       callSource: media.callSource,
@@ -1974,18 +2239,58 @@ async function runArmedCallJob(job) {
       vpsDetach: detach || undefined,
       originalCallStillActive: detach ? Boolean(detach.originalCallStillActive) : undefined,
     };
+    media = null;
 
+    updateArmedCallJob(job, {
+      status: 'waiting_hangup',
+      result,
+    });
+    console.log(`[call-arm] playback finished; waiting for phone hangup room=${job.roomId}`);
+
+    const remoteInfo = await remoteHangupPromise;
+    if (job.cancelled) {
+      const error = new Error('call-arm cancelled');
+      error.code = 'CALL_ARM_CANCELLED';
+      throw error;
+    }
+    if (remoteInfo?.ended) {
+      await finishRemoteHangupJob(job, session, remoteInfo, null, playback, tts);
+      return;
+    }
+
+    job.stopRemoteHangupWatch = true;
     updateArmedCallJob(job, {
       status: 'finished',
       finishedAt: Date.now(),
-      result,
+      result: { ...result, remoteHangup: remoteInfo },
     });
-    console.log(`[call-arm] finished room=${job.roomId} originalActive=${result.originalCallStillActive}`);
+    console.log(`[call-arm] finished room=${job.roomId} hangupWatch=${remoteInfo?.reason || 'unknown'}`);
   } catch (error) {
-    if (session) await cleanupArmedCallMedia(job, session);
+    if (error?.code === 'CALL_REMOTE_DECLINED') {
+      job.stopRemoteHangupWatch = true;
+      await finishRemoteHangupJob(job, session, error.remoteEnd || { ended: true, reason: 'declined' }, null, null, null);
+      return;
+    }
 
     const cancelled = error?.code === 'CALL_ARM_CANCELLED' || job.cancelled;
     const timedOut = error?.code === 'CALL_ARM_TIMEOUT';
+
+    // If attach/playback failed because the phone disappeared at the same time,
+    // give the already-running remote watcher one short chance to classify it as
+    // a clean remote hangup instead of a media failure.
+    if (!cancelled && !timedOut && remoteHangupPromise) {
+      const remoteInfo = await Promise.race([
+        remoteHangupPromise.catch(() => null),
+        new Promise((resolve) => setTimeout(() => resolve(null), REMOTE_HANGUP_STABLE_MS + 300)),
+      ]);
+      if (remoteInfo?.ended) {
+        await finishRemoteHangupJob(job, session, remoteInfo, media, null, null);
+        return;
+      }
+    }
+
+    job.stopRemoteHangupWatch = true;
+    if (session) await cleanupArmedCallMedia(job, session);
     updateArmedCallJob(job, {
       status: cancelled ? 'cancelled' : timedOut ? 'timeout' : 'failed',
       finishedAt: Date.now(),
@@ -2419,6 +2724,11 @@ const server = http.createServer(async (req, res) => {
       activeRtcRoomCount: activeRtcRoomIds.length,
       activeRtcRoomIds,
       matrixRtcSafetyTimeoutMs: MATRIX_RTC_SAFETY_TIMEOUT_MS,
+      remoteHangupCleanup: {
+        stableMs: REMOTE_HANGUP_STABLE_MS,
+        watchTimeoutMs: REMOTE_HANGUP_WATCH_TIMEOUT_MS,
+        clearsExternalCallerMembership: true,
+      },
       liveKitE2ee: {
         ratchetWindowSize: MATRIXRTC_E2EE_RATCHET_WINDOW_SIZE,
         failureTolerance: MATRIXRTC_E2EE_FAILURE_TOLERANCE,
@@ -2890,7 +3200,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const existing = armedCallJobs.get(selected.roomId);
-      const terminalStatuses = new Set(['finished', 'failed', 'timeout', 'cancelled']);
+      const terminalStatuses = new Set(['finished', 'failed', 'timeout', 'cancelled', 'remote_hangup']);
       if (existing && !terminalStatuses.has(existing.status)) {
         return sendJson(res, 409, {
           ok: false,
@@ -2928,6 +3238,10 @@ const server = http.createServer(async (req, res) => {
         deadlineAt: now + waitForAnswerMs,
         answeredAt: null,
         startedPlayingAt: null,
+        remoteHangupAt: null,
+        callerDeviceIds: [],
+        targetMembership: null,
+        stopRemoteHangupWatch: false,
         finishedAt: null,
         error: '',
         result: null,
@@ -2978,7 +3292,7 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 401, { ok: false, error: 'unauthorized' });
       }
 
-      const terminalStatuses = new Set(['finished', 'failed', 'timeout', 'cancelled']);
+      const terminalStatuses = new Set(['finished', 'failed', 'timeout', 'cancelled', 'remote_hangup']);
       if (terminalStatuses.has(job.status)) {
         return sendJson(res, 200, {
           ok: true,
