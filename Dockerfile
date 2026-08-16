@@ -9,6 +9,8 @@ RUN apt-get update \
 
 COPY package*.json ./
 RUN npm ci --omit=dev \
+    && npm install --omit=dev --no-save livekit-server-sdk@2.17.0 \
+    && node -e "import('livekit-server-sdk').then(()=>console.log('livekit-server-sdk build check=OK')).catch(e=>{console.error(e);process.exit(1)})" \
     && sed -i 's|from "../http-api";|from "../http-api/index.js";|g' node_modules/matrix-js-sdk/lib/oauth/index.js node_modules/matrix-js-sdk/lib/oauth/authorize.js \
     && grep -n 'http-api/index.js' node_modules/matrix-js-sdk/lib/oauth/index.js node_modules/matrix-js-sdk/lib/oauth/authorize.js
 
