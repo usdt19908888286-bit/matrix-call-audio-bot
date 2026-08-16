@@ -4,9 +4,14 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
-const BOT_VERSION = '2026.08.16.2';
+const BOT_VERSION = '2026.08.16.3';
 const SECRET = String(process.env.AUDIO_BOT_SECRET || '').trim();
 const AUDIO_DIR = String(process.env.AUDIO_DIR || '/app/audio');
+const AZURE_SPEECH_KEY = String(process.env.AZURE_SPEECH_KEY || '').trim();
+const AZURE_SPEECH_REGION = String(process.env.AZURE_SPEECH_REGION || '').trim().toLowerCase();
+const AZURE_TTS_VOICE = String(process.env.AZURE_TTS_VOICE || 'zh-CN-XiaoxiaoNeural').trim() || 'zh-CN-XiaoxiaoNeural';
+const AZURE_TTS_LOCALE = String(process.env.AZURE_TTS_LOCALE || 'zh-CN').trim() || 'zh-CN';
+const AZURE_TTS_OUTPUT_FORMAT = 'riff-24khz-16bit-mono-pcm';
 const MATRIX_HOMESERVER = String(process.env.MATRIX_HOMESERVER || '').replace(/\/$/, '');
 const MATRIX_USER_ID = String(process.env.MATRIX_USER_ID || '').trim();
 const MATRIX_PASSWORD = String(process.env.MATRIX_PASSWORD || '');
@@ -118,6 +123,67 @@ function normalizeAudioName(value) {
 
 function audioFilePath(name) {
   return path.join(AUDIO_DIR, `${name}.wav`);
+}
+
+function azureTtsConfigured() {
+  return Boolean(AZURE_SPEECH_KEY && AZURE_SPEECH_REGION);
+}
+
+function escapeXml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+async function synthesizeAzureTtsWav(text, voice = AZURE_TTS_VOICE) {
+  const ttsText = String(text || '').trim();
+  if (!ttsText) {
+    const error = new Error('TTS text is empty');
+    error.status = 400;
+    throw error;
+  }
+  if (!azureTtsConfigured()) {
+    const error = new Error('Microsoft TTS is not configured. Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION.');
+    error.status = 503;
+    throw error;
+  }
+  if (!/^[a-z0-9-]+$/i.test(AZURE_SPEECH_REGION)) {
+    const error = new Error('invalid AZURE_SPEECH_REGION');
+    error.status = 500;
+    throw error;
+  }
+
+  const selectedVoice = String(voice || AZURE_TTS_VOICE).trim() || AZURE_TTS_VOICE;
+  const endpoint = `https://${AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`;
+  const ssml = `<speak version="1.0" xml:lang="${escapeXml(AZURE_TTS_LOCALE)}"><voice name="${escapeXml(selectedVoice)}">${escapeXml(ttsText)}</voice></speak>`;
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Ocp-Apim-Subscription-Key': AZURE_SPEECH_KEY,
+      'Content-Type': 'application/ssml+xml',
+      'X-Microsoft-OutputFormat': AZURE_TTS_OUTPUT_FORMAT,
+      'User-Agent': 'matrix-call-audio-bot',
+    },
+    body: ssml,
+  });
+
+  if (!response.ok) {
+    const body = await response.text().catch(() => '');
+    const error = new Error(`Microsoft TTS failed (HTTP ${response.status}): ${body || response.statusText}`);
+    error.status = response.status >= 400 && response.status < 600 ? response.status : 502;
+    throw error;
+  }
+
+  const wav = Buffer.from(await response.arrayBuffer());
+  if (wav.length < 44 || wav.toString('ascii', 0, 4) !== 'RIFF' || wav.toString('ascii', 8, 12) !== 'WAVE') {
+    const error = new Error('Microsoft TTS returned invalid WAV audio');
+    error.status = 502;
+    throw error;
+  }
+  return { wav, voice: selectedVoice, text: ttsText };
 }
 
 function serveWavFile(res, name) {
@@ -1518,6 +1584,7 @@ function publicArmedCallJob(job) {
     senderUserId: job.senderUserId || '',
     targetUserId: job.targetUserId || '',
     audio: job.audio,
+    tts: job.ttsText ? { provider: 'microsoft', voice: job.ttsVoice || AZURE_TTS_VOICE, chars: job.ttsText.length } : undefined,
     repeat: job.repeat,
     status: job.status,
     createdAt: job.createdAt,
@@ -1619,8 +1686,17 @@ async function cleanupArmedCallMedia(job, session) {
 async function runArmedCallJob(job) {
   let session = null;
   let media = null;
+  let ttsTask = null;
   try {
     session = job.matrixSession || await ensureMatrixSession();
+    if (job.ttsText) {
+      const ttsStartedAt = Date.now();
+      console.log(`[call-arm] pre-synthesizing Microsoft TTS room=${job.roomId} chars=${job.ttsText.length} voice=${job.ttsVoice || AZURE_TTS_VOICE}`);
+      ttsTask = synthesizeAzureTtsWav(job.ttsText, job.ttsVoice || AZURE_TTS_VOICE).then(
+        (synthesized) => ({ ok: true, synthesized, synthesizeMs: Date.now() - ttsStartedAt }),
+        (error) => ({ ok: false, error, synthesizeMs: Date.now() - ttsStartedAt }),
+      );
+    }
     const answered = await waitForArmedCallAnswer(job, session);
     if (!isArmedCallJobCurrent(job)) {
       const error = new Error('call-arm cancelled');
@@ -1646,8 +1722,24 @@ async function runArmedCallJob(job) {
     }
 
     updateArmedCallJob(job, { status: 'playing', startedPlayingAt: Date.now() });
-    console.log(`[call-arm] playing room=${job.roomId} audio=${job.audio} repeat=${job.repeat} source=${media.callSource}`);
-    const playback = await publishWavToLiveKit(job.roomId, job.audio, job.repeat);
+    let playback;
+    let tts = null;
+    if (job.ttsText) {
+      const prepared = await ttsTask;
+      if (!prepared?.ok) throw prepared?.error || new Error('Microsoft TTS synthesis failed');
+      const synthesized = prepared.synthesized;
+      tts = {
+        provider: 'microsoft',
+        voice: synthesized.voice,
+        chars: synthesized.text.length,
+        synthesizeMs: prepared.synthesizeMs,
+      };
+      console.log(`[call-arm] playing room=${job.roomId} tts=microsoft voice=${synthesized.voice} repeat=${job.repeat} source=${media.callSource}`);
+      playback = await publishWavToLiveKit(job.roomId, 'tts', job.repeat, synthesized.wav);
+    } else {
+      console.log(`[call-arm] playing room=${job.roomId} audio=${job.audio} repeat=${job.repeat} source=${media.callSource}`);
+      playback = await publishWavToLiveKit(job.roomId, job.audio, job.repeat);
+    }
 
     if (!isArmedCallJobCurrent(job)) {
       const error = new Error('call-arm cancelled during playback');
@@ -1661,6 +1753,7 @@ async function runArmedCallJob(job) {
       callSource: media.callSource,
       remote: media.remote,
       playback,
+      tts: tts || undefined,
       vpsDetach: detach || undefined,
       originalCallStillActive: detach ? Boolean(detach.originalCallStillActive) : undefined,
     };
@@ -1932,7 +2025,7 @@ function parsePcm16Wav(fileBuffer) {
   };
 }
 
-async function publishWavToLiveKit(roomId, audioName, repeat = 1) {
+async function publishWavToLiveKit(roomId, audioName, repeat = 1, wavBufferOverride = null) {
   const connection = liveKitConnections.get(roomId);
   if (!connection?.room?.isConnected) {
     const error = new Error('LiveKit room is not connected');
@@ -1955,9 +2048,9 @@ async function publishWavToLiveKit(roomId, audioName, repeat = 1) {
     // Keep the built-in test tone consistent with GET /audio/test.wav so a
     // fresh deployment can verify encrypted MatrixRTC playback without first
     // mounting or uploading an audio file.
-    const wavBuffer = name === 'test'
+    const wavBuffer = wavBufferOverride || (name === 'test'
       ? makeTestWav()
-      : fs.readFileSync(audioFilePath(name));
+      : fs.readFileSync(audioFilePath(name)));
     wav = parsePcm16Wav(wavBuffer);
   } catch (e) {
     if (e?.code === 'ENOENT') {
@@ -2078,6 +2171,13 @@ const server = http.createServer(async (req, res) => {
       audioDir: AUDIO_DIR,
       matrixConfigured: matrixConfigured(),
       workLinkedSenderSupported: true,
+      microsoftTts: {
+        configured: azureTtsConfigured(),
+        region: AZURE_SPEECH_REGION || '',
+        voice: AZURE_TTS_VOICE,
+        locale: AZURE_TTS_LOCALE,
+        outputFormat: AZURE_TTS_OUTPUT_FORMAT,
+      },
       dynamicSenderSessionCount: dynamicMatrixSessions.size,
       rtcClean: activeRtcRoomIds.length === 0,
       activeRtcRoomCount: activeRtcRoomIds.length,
@@ -2526,6 +2626,8 @@ const server = http.createServer(async (req, res) => {
       const audio = normalizeAudioName(body.audio || 'test');
       const repeat = Math.max(1, Math.min(10, Number(body.repeat || 1)));
       const targetUserId = String(body.targetUserId || '').trim();
+      const ttsText = String(body.ttsText || '').trim();
+      const ttsVoice = String(body.ttsVoice || AZURE_TTS_VOICE).trim() || AZURE_TTS_VOICE;
       const requestedWaitForAnswerMs = Number(body.waitForAnswerMs);
       const waitForAnswerMs = Number.isFinite(requestedWaitForAnswerMs)
         ? Math.max(5000, Math.min(180000, Math.round(requestedWaitForAnswerMs)))
@@ -2535,13 +2637,19 @@ const server = http.createServer(async (req, res) => {
         ? Math.max(1000, Math.min(30000, Math.round(requestedWaitForRemoteMs)))
         : 15000;
 
-      if (!audio) return sendJson(res, 400, { ok: false, error: 'invalid audio name' });
-      if (audio !== 'test') {
-        const file = audioFilePath(audio);
-        try {
-          if (!fs.statSync(file).isFile()) throw new Error('not a file');
-        } catch {
-          return sendJson(res, 404, { ok: false, error: `audio not found: ${audio}.wav` });
+      if (ttsText.length > 5000) return sendJson(res, 400, { ok: false, error: 'ttsText is too long (max 5000 chars)' });
+      if (ttsText && !azureTtsConfigured()) {
+        return sendJson(res, 503, { ok: false, error: 'Microsoft TTS is not configured on VPS' });
+      }
+      if (!ttsText) {
+        if (!audio) return sendJson(res, 400, { ok: false, error: 'invalid audio name' });
+        if (audio !== 'test') {
+          const file = audioFilePath(audio);
+          try {
+            if (!fs.statSync(file).isFile()) throw new Error('not a file');
+          } catch {
+            return sendJson(res, 404, { ok: false, error: `audio not found: ${audio}.wav` });
+          }
         }
       }
 
@@ -2572,6 +2680,8 @@ const server = http.createServer(async (req, res) => {
         targetUserId,
         matrixSession: session,
         audio,
+        ttsText,
+        ttsVoice,
         repeat,
         waitForAnswerMs,
         waitForRemoteMs,
@@ -2587,7 +2697,7 @@ const server = http.createServer(async (req, res) => {
         result: null,
       };
       armedCallJobs.set(selected.roomId, job);
-      console.log(`[call-arm] armed room=${selected.roomId} sender=${session.userId} target=${targetUserId || '*'} audio=${audio} repeat=${repeat} source=${workLinked ? 'work' : 'legacy'}`);
+      console.log(`[call-arm] armed room=${selected.roomId} sender=${session.userId} target=${targetUserId || '*'} media=${ttsText ? `tts:${ttsVoice}` : `audio:${audio}`} repeat=${repeat} source=${workLinked ? 'work' : 'legacy'}`);
       void runArmedCallJob(job);
 
       return sendJson(res, 202, {
